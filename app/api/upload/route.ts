@@ -1,7 +1,7 @@
 import { handleUpload, type HandleUploadBody } from "@vercel/blob/client";
 import { NextResponse } from "next/server";
 import { ENCRYPTION_OVERHEAD_BYTES, MAX_FILE_SIZE_BYTES } from "@/lib/constants";
-import { enforceRateLimit, requireActiveUser } from "@/lib/store";
+import { enforceRateLimit, isDurableStoreConfigured, requireActiveUser } from "@/lib/store";
 import { ApiError, cleanRoomId } from "@/lib/validation";
 
 export const runtime = "nodejs";
@@ -12,6 +12,9 @@ export async function POST(request: Request) {
     await enforceRateLimit(request, "blob-upload-token", 30, 60);
     if (!process.env.BLOB_READ_WRITE_TOKEN) {
       throw new ApiError("File uploads are not configured. Add BLOB_READ_WRITE_TOKEN from your Vercel Blob store.");
+    }
+    if (process.env.VERCEL === "1" && !isDurableStoreConfigured()) {
+      throw new ApiError("Vercel metadata storage is not configured. Add UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN.");
     }
     const body = (await request.json()) as HandleUploadBody;
 

@@ -21,8 +21,9 @@ This document explains the current Next.js/Vercel workflow for secure multi-reci
 2. Files above 50 MB show an in-app alert before upload.
 3. The sender enters:
    - Download limit: minimum 1, no product cap.
-   - Expiry time: 10 to 180 minutes.
+   - Or expiry time: 1 to 180 minutes.
 4. Both values are validated again in `POST /api/rooms/[roomId]/clips`.
+5. Only one policy is active. Download mode ignores the time input; time mode ignores the download-count input.
 
 ## 4. Sender Selects Recipients
 
@@ -79,8 +80,8 @@ This document explains the current Next.js/Vercel workflow for secure multi-reci
 
 ## 9. Self-Destruction
 
-1. Time expiry blocks access after 10 to 180 minutes.
-2. Download expiry blocks access once the counter reaches zero.
+1. Time expiry blocks access after 1 to 180 minutes when time mode is selected.
+2. Download expiry blocks access once the counter reaches zero when download mode is selected.
 3. On the final download, the API schedules Blob and metadata cleanup.
 4. Expired shares are also cleaned opportunistically when touched by inbox or download routes.
 

@@ -69,6 +69,7 @@ export type ShareRecord = {
   blobPathname: string;
   createdAt: number;
   expiresAt: number;
+  expiryMode: "downloads" | "time";
   downloadLimit: number;
 };
 
@@ -84,6 +85,7 @@ export type ClipRecord = {
   metadata: RecipientMetadata;
   createdAt: number;
   expiresAt: number;
+  expiryMode?: "downloads" | "time";
 };
 
 export type InboxClip = {
@@ -93,6 +95,6 @@ export type InboxClip = {
   sizeBytes: number;
   createdAt: number;
   expiresAt: number;
+  expiryMode: "downloads" | "time";
   viewsLeft: number;
 };
-

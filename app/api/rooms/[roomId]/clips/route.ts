@@ -69,6 +69,7 @@ export async function POST(request: Request, context: { params: Promise<{ roomId
       blobDownloadUrl: payload.blobDownloadUrl ? validateBlobUrl(payload.blobDownloadUrl) : undefined,
       blobPathname: validateBlobPathname(payload.blobPathname, roomId),
       expiresInSeconds: validateExpirySeconds(payload.expiresInSeconds),
+      expiryMode: payload.expiryMode === "time" ? "time" : "downloads",
       downloadLimit: validateDownloadLimit(payload.downloadLimit)
     });
 

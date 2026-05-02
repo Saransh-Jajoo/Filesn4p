@@ -7,8 +7,9 @@ FileSn4p is a production-oriented, browser-encrypted file-sharing app built with
 - Light and dark mode with CSS variables, system preference detection, persistent theme selection, and separate optimized SVG logos in `public/logo-light.svg` and `public/logo-dark.svg`.
 - Framer Motion transitions for page, step, recipient, alert, and inbox state changes.
 - 50 MB maximum file size with browser-side alerting and server-side upload token limits.
-- User-entered download limit with minimum `1` and no product-level cap.
-- User-entered expiry from 10 minutes to 3 hours.
+- Exclusive self-destruct policy: choose either download limit or time expiry.
+- Download limit has minimum `1` and no product-level cap.
+- Time expiry is user-entered from 1 minute to 3 hours.
 - Multi-user sharing to 10+ active recipients in one flow.
 - No public online roster. Recipients are only discovered through explicit username search.
 - Browser-side E2E encryption using Web Crypto ECDH P-256, HKDF-SHA256, and AES-256-GCM.
@@ -108,6 +109,8 @@ Legacy Flask variables in older versions are not used by the Next.js/Vercel app.
 7. Health-check `/api/health`; production should return `durableStore:true`.
 
 If sharing shows `Vercel Blob: Failed to retrieve the client token`, the deployment is missing `BLOB_READ_WRITE_TOKEN` or the Blob store is not connected to the Vercel project. The app also checks this at login and `/api/health` reports `blobConfigured:false` when uploads are not ready.
+
+After adding or changing environment variables in Vercel, redeploy the project. Existing deployments do not automatically pick up newly added environment variables.
 
 ## Security Design
 

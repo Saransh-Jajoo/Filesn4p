@@ -98,7 +98,7 @@ export function validateExpirySeconds(value: unknown) {
   const parsed = Number(value);
   if (!Number.isInteger(parsed)) throw new ApiError("Expiry must be a whole number of seconds.");
   if (parsed < MIN_EXPIRY_SECONDS || parsed > MAX_EXPIRY_SECONDS) {
-    throw new ApiError("Expiry must be between 10 minutes and 3 hours.");
+    throw new ApiError("Expiry must be between 1 minute and 3 hours.");
   }
   return parsed;
 }

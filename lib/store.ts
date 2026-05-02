@@ -282,6 +282,7 @@ export async function createShare(input: {
   blobDownloadUrl?: string;
   blobPathname: string;
   expiresInSeconds: number;
+  expiryMode: "downloads" | "time";
   downloadLimit: number;
 }) {
   const timestamp = nowSeconds();
@@ -317,6 +318,7 @@ export async function createShare(input: {
     blobPathname: input.blobPathname,
     createdAt: timestamp,
     expiresAt,
+    expiryMode: input.expiryMode,
     downloadLimit: input.downloadLimit
   };
 
@@ -373,6 +375,7 @@ export async function listInbox(roomId: string, userId: string): Promise<InboxCl
         sizeBytes: clip.sizeBytes,
         createdAt: clip.createdAt,
         expiresAt: clip.expiresAt,
+        expiryMode: share.expiryMode,
         viewsLeft
       };
     })

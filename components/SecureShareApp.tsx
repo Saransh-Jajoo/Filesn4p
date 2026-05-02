@@ -6,7 +6,6 @@ import {
   AlertCircle,
   ArrowLeft,
   Check,
-  Clock,
   Download,
   FileText,
   Inbox,
@@ -25,6 +24,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CLIP_TYPE,
   CURVE,
+  MAX_EXPIRY_SECONDS,
   MAX_FILE_SIZE_BYTES,
   PUBLIC_KEY_TYPE
 } from "@/lib/constants";
@@ -56,6 +56,8 @@ type Session = {
   durableStore: boolean;
   blobConfigured: boolean;
 };
+
+type ExpiryMode = "downloads" | "time";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -252,6 +254,14 @@ function downloadBuffer(buffer: ArrayBuffer, filename: string) {
   window.setTimeout(() => URL.revokeObjectURL(url), 1200);
 }
 
+function errorMessage(error: unknown) {
+  const message = error instanceof Error ? error.message : "Request failed.";
+  if (message.toLowerCase().includes("failed to retrieve the client token")) {
+    return "Upload token could not be created. In Vercel, connect a Blob store, set BLOB_READ_WRITE_TOKEN, set Redis env variables, then redeploy.";
+  }
+  return message;
+}
+
 export default function SecureShareApp() {
   const [theme, setTheme] = useState<Theme>("dark");
   const [identity, setIdentity] = useState<Identity | null>(null);
@@ -262,9 +272,11 @@ export default function SecureShareApp() {
   const [step, setStep] = useState<Step>("file");
   const [dragging, setDragging] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [expiryMode, setExpiryMode] = useState<ExpiryMode>("downloads");
   const [downloadLimit, setDownloadLimit] = useState("1");
-  const [expiryMinutes, setExpiryMinutes] = useState("10");
+  const [expiryMinutes, setExpiryMinutes] = useState("1");
   const [searchQuery, setSearchQuery] = useState("");
+  const [hasSearched, setHasSearched] = useState(false);
   const [searchResults, setSearchResults] = useState<User[]>([]);
   const [selectedRecipients, setSelectedRecipients] = useState<User[]>([]);
   const [inbox, setInbox] = useState<InboxClip[]>([]);
@@ -358,7 +370,7 @@ export default function SecureShareApp() {
         kind: !data.blobConfigured || !data.durableStore ? "error" : undefined
       });
     } catch (error) {
-      setStatus({ text: error instanceof Error ? error.message : "Could not join.", kind: "error" });
+      setStatus({ text: errorMessage(error), kind: "error" });
     } finally {
       setBusy(false);
     }
@@ -388,6 +400,7 @@ export default function SecureShareApp() {
   const searchRecipients = async () => {
     if (!session || !searchQuery.trim()) {
       setSearchResults([]);
+      setHasSearched(false);
       return;
     }
     setBusy(true);
@@ -396,8 +409,14 @@ export default function SecureShareApp() {
         `/api/rooms/${session.roomId}/users/search?q=${encodeURIComponent(searchQuery)}&userId=${encodeURIComponent(session.userId)}`
       );
       setSearchResults(data.users);
+      setHasSearched(true);
+      if (!data.users.length) {
+        setStatus({ text: `No active user found for "${searchQuery.trim()}".`, kind: "error" });
+      } else {
+        setStatus({ text: "" });
+      }
     } catch (error) {
-      setStatus({ text: error instanceof Error ? error.message : "Search failed.", kind: "error" });
+      setStatus({ text: errorMessage(error), kind: "error" });
     } finally {
       setBusy(false);
     }
@@ -420,12 +439,12 @@ export default function SecureShareApp() {
 
     const parsedDownloadLimit = Number(downloadLimit);
     const parsedExpiry = Number(expiryMinutes);
-    if (!Number.isSafeInteger(parsedDownloadLimit) || parsedDownloadLimit < 1) {
+    if (expiryMode === "downloads" && (!Number.isSafeInteger(parsedDownloadLimit) || parsedDownloadLimit < 1)) {
       setStatus({ text: "Download limit must be at least 1.", kind: "error" });
       return;
     }
-    if (!Number.isInteger(parsedExpiry) || parsedExpiry < 10 || parsedExpiry > 180) {
-      setStatus({ text: "Expiry must be between 10 and 180 minutes.", kind: "error" });
+    if (expiryMode === "time" && (!Number.isInteger(parsedExpiry) || parsedExpiry < 1 || parsedExpiry > 180)) {
+      setStatus({ text: "Expiry must be between 1 and 180 minutes.", kind: "error" });
       return;
     }
 
@@ -454,8 +473,9 @@ export default function SecureShareApp() {
           blobUrl: blob.url,
           blobDownloadUrl: "downloadUrl" in blob ? blob.downloadUrl : undefined,
           blobPathname: blob.pathname,
-          downloadLimit,
-          expiresInSeconds: parsedExpiry * 60
+          expiryMode,
+          downloadLimit: expiryMode === "downloads" ? downloadLimit : String(Number.MAX_SAFE_INTEGER),
+          expiresInSeconds: expiryMode === "time" ? parsedExpiry * 60 : MAX_EXPIRY_SECONDS
         })
       });
 
@@ -463,7 +483,7 @@ export default function SecureShareApp() {
       setStep("sent");
       await refreshInbox();
     } catch (error) {
-      setStatus({ text: error instanceof Error ? error.message : "Send failed.", kind: "error" });
+      setStatus({ text: errorMessage(error), kind: "error" });
     } finally {
       setBusy(false);
     }
@@ -499,8 +519,9 @@ export default function SecureShareApp() {
     setSelectedRecipients([]);
     setSearchResults([]);
     setSearchQuery("");
+    setExpiryMode("downloads");
     setDownloadLimit("1");
-    setExpiryMinutes("10");
+    setExpiryMinutes("1");
     setStep("file");
     setStatus({ text: "" });
     if (inputRef.current) inputRef.current.value = "";
@@ -550,23 +571,36 @@ export default function SecureShareApp() {
                     Browser encrypted
                   </span>
                   <h1>FileSn4p</h1>
-                  <p>Share encrypted files with active recipients. Links expire, downloads are counted, and file keys stay in the browser.</p>
+                  <p>Private short-lived file transfer for real work: simple enough for anyone to use, strict enough for sensitive handoffs.</p>
                 </div>
-                <div className="signal-grid" aria-label="Security summary">
-                  <div className="signal">
-                    <UploadCloud size={22} />
-                    <strong>50 MB</strong>
-                    <span>Upload limit</span>
+                <div className="feature-stack" aria-label="Security and product details">
+                  <div className="feature-row">
+                    <ShieldCheck size={22} />
+                    <div>
+                      <strong>End-to-end encrypted</strong>
+                      <span>AES-256-GCM protects the file, while ECDH P-256 and HKDF-SHA256 wrap the file key for each recipient.</span>
+                    </div>
                   </div>
-                  <div className="signal">
-                    <Clock size={22} />
-                    <strong>10-180 min</strong>
-                    <span>Expiry window</span>
+                  <div className="feature-row">
+                    <FileText size={22} />
+                    <div>
+                      <strong>Zero-knowledge storage</strong>
+                      <span>The server stores ciphertext only. Private keys stay in the current browser tab and are never sent to FileSn4p.</span>
+                    </div>
                   </div>
-                  <div className="signal">
+                  <div className="feature-row">
                     <Users size={22} />
-                    <strong>Multi-send</strong>
-                    <span>One share flow</span>
+                    <div>
+                      <strong>Private recipient discovery</strong>
+                      <span>No public online roster. You search for the person you intend to send to, then verify their fingerprint.</span>
+                    </div>
+                  </div>
+                  <div className="feature-row">
+                    <UploadCloud size={22} />
+                    <div>
+                      <strong>Self-destructing access</strong>
+                      <span>Choose either a download limit or a time limit from 1 minute to 3 hours.</span>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -607,6 +641,12 @@ export default function SecureShareApp() {
               transition={{ duration: 0.24 }}
             >
               <div className="workspace-panel">
+                {!session.blobConfigured ? (
+                  <div className="config-banner" role="alert">
+                    <AlertCircle size={18} />
+                    <span>Add <strong>BLOB_READ_WRITE_TOKEN</strong> in Vercel, then redeploy to enable file sharing.</span>
+                  </div>
+                ) : null}
                 <div className="tabs" role="tablist" aria-label="Workspace tabs">
                   <button className={`tab ${tab === "send" ? "active" : ""}`} type="button" onClick={() => setTab("send")}>
                     <Send size={16} />
@@ -690,36 +730,60 @@ export default function SecureShareApp() {
                             </div>
                           )}
 
-                          <div className="policy-grid">
-                            <div className="field">
-                              <label htmlFor="downloadLimit">Download limit</label>
-                              <input
-                                id="downloadLimit"
-                                className="number-input"
-                                value={downloadLimit}
-                                min={1}
-                                step={1}
-                                inputMode="numeric"
-                                type="number"
-                                onChange={(event) => setDownloadLimit(event.target.value)}
-                              />
-                              <p className="hint-text">Minimum 1. No product cap.</p>
+                          <div className="policy-box">
+                            <div className="policy-switch" role="radiogroup" aria-label="Expiry policy">
+                              <button
+                                className={`policy-choice ${expiryMode === "downloads" ? "active" : ""}`}
+                                type="button"
+                                role="radio"
+                                aria-checked={expiryMode === "downloads"}
+                                onClick={() => setExpiryMode("downloads")}
+                              >
+                                Downloads
+                              </button>
+                              <button
+                                className={`policy-choice ${expiryMode === "time" ? "active" : ""}`}
+                                type="button"
+                                role="radio"
+                                aria-checked={expiryMode === "time"}
+                                onClick={() => setExpiryMode("time")}
+                              >
+                                Time
+                              </button>
                             </div>
-                            <div className="field">
-                              <label htmlFor="expiryMinutes">Expiry time</label>
-                              <input
-                                id="expiryMinutes"
-                                className="number-input"
-                                value={expiryMinutes}
-                                min={10}
-                                max={180}
-                                step={1}
-                                inputMode="numeric"
-                                type="number"
-                                onChange={(event) => setExpiryMinutes(event.target.value)}
-                              />
-                              <p className="hint-text">10 minutes to 3 hours.</p>
-                            </div>
+
+                            {expiryMode === "downloads" ? (
+                              <div className="field">
+                                <label htmlFor="downloadLimit">Download limit</label>
+                                <input
+                                  id="downloadLimit"
+                                  className="number-input"
+                                  value={downloadLimit}
+                                  min={1}
+                                  step={1}
+                                  inputMode="numeric"
+                                  type="number"
+                                  onChange={(event) => setDownloadLimit(event.target.value)}
+                                />
+                                <p className="hint-text">Minimum 1. File access ends after this many downloads.</p>
+                              </div>
+                            ) : (
+                              <div className="field">
+                                <label htmlFor="expiryMinutes">Expiry time</label>
+                                <input
+                                  id="expiryMinutes"
+                                  className="number-input"
+                                  value={expiryMinutes}
+                                  min={1}
+                                  max={180}
+                                  step={1}
+                                  inputMode="numeric"
+                                  type="number"
+                                  onChange={(event) => setExpiryMinutes(event.target.value)}
+                                />
+                                <p className="hint-text">1 minute to 3 hours.</p>
+                              </div>
+                            )}
                           </div>
 
                           <button className="button" type="button" disabled={!selectedFile} onClick={() => setStep("recipients")}>
@@ -748,7 +812,10 @@ export default function SecureShareApp() {
                               className="input"
                               value={searchQuery}
                               maxLength={32}
-                              onChange={(event) => setSearchQuery(event.target.value)}
+                              onChange={(event) => {
+                                setSearchQuery(event.target.value);
+                                setHasSearched(false);
+                              }}
                               onKeyDown={(event) => {
                                 if (event.key === "Enter") {
                                   event.preventDefault();
@@ -802,7 +869,9 @@ export default function SecureShareApp() {
                                 );
                               })
                             ) : (
-                              <div className="empty-state">Search for active recipients.</div>
+                              <div className="empty-state">
+                                {hasSearched ? `No user found for "${searchQuery.trim()}".` : "Search by username to find a recipient."}
+                              </div>
                             )}
                           </div>
 
@@ -847,8 +916,10 @@ export default function SecureShareApp() {
                               <div className="inbox-copy">
                                 <strong>{clip.filename}</strong>
                                 <span>
-                                  From {clip.senderName} | {formatBytes(clip.sizeBytes)} | {clip.viewsLeft} download
-                                  {clip.viewsLeft === 1 ? "" : "s"} left | {formatTimeLeft(clip.expiresAt)}
+                                  From {clip.senderName} | {formatBytes(clip.sizeBytes)} |{" "}
+                                  {clip.expiryMode === "time"
+                                    ? `expires in ${formatTimeLeft(clip.expiresAt)}`
+                                    : `${clip.viewsLeft} download${clip.viewsLeft === 1 ? "" : "s"} left`}
                                 </span>
                               </div>
                               <div className="inbox-actions">
