@@ -1,160 +1,135 @@
-# Secure File Vault
+# FileSn4p
 
-A robust, production-ready web application built with Python and Flask for encrypted temporary file sharing and password-based file encryption.
+FileSn4p is a production-oriented, browser-encrypted file-sharing app built with Next.js for Vercel. It supports light and dark themes, multi-recipient sharing, expiring access, flexible download limits, and direct private Vercel Blob uploads so large files do not pass through serverless request bodies.
 
 ## Features
 
-- **Encrypted Online Clipboard**: Join the website lobby, see active users, and send encrypted files directly to one or more receivers.
-- **Self-Destruct Policies**: Clips can be destroyed after 1 or 2 downloads and expire after 5 minutes, 10 minutes, 2 hours, or 3 hours.
-- **Browser-Side Public-Key Crypto**: The clipboard uses Web Crypto in the browser with ECDH, HKDF-SHA256, and AES-256-GCM.
-- **Encrypted Server Storage Only**: The server stores ciphertext and metadata, never plaintext clipboard files or private keys.
-- **Rate Limited APIs**: Flask-Limiter protects lobby, presence, upload, download, and classic encrypt/decrypt endpoints.
-- **Upload & Encrypt**: Secure files using AES-256 GCM authenticated encryption.
-- **Upload & Decrypt**: Safely decrypt previously secured files.
-- **Graceful Error Handling**: Detects incorrect passwords and corrupted files via tag validation.
-- **Secure by Design**: Minimal dependencies, CSRF protection, and path traversal prevention.
-- **File Size Limits**: Built-in mechanisms blocking files larger than 20MB.
+- Light and dark mode with CSS variables, system preference detection, persistent theme selection, and separate optimized SVG logos in `public/logo-light.svg` and `public/logo-dark.svg`.
+- Framer Motion transitions for page, step, recipient, alert, and inbox state changes.
+- 50 MB maximum file size with browser-side alerting and server-side upload token limits.
+- User-entered download limit with minimum `1` and no product-level cap.
+- User-entered expiry from 10 minutes to 3 hours.
+- Multi-user sharing to 10+ active recipients in one flow.
+- No public online roster. Recipients are only discovered through explicit username search.
+- Browser-side E2E encryption using Web Crypto ECDH P-256, HKDF-SHA256, and AES-256-GCM.
+- Private Vercel Blob storage for encrypted payloads.
+- Redis/Upstash metadata storage for Vercel serverless durability.
+- Serverless Next.js route handlers only. No long-running backend process.
+- Rate limits, input validation, expiring metadata, high-entropy IDs, and recipient-only downloads.
 
-## Cryptography Details
+## Architecture
 
-This application uses the `cryptography` library to adhere to modern cryptography standards.
+```text
+Browser
+  - Generates temporary ECDH identity
+  - Encrypts file once with AES-256-GCM
+  - Wraps the AES key separately for each recipient
+  - Uploads ciphertext directly to private Vercel Blob
 
-### Encrypted Online Clipboard
-The live clipboard flow is handled in the browser through `static/channel.js`:
+Next.js API routes
+  - Track active lobby users in Redis
+  - Authorize direct Blob upload tokens
+  - Store share metadata and per-recipient wrapped keys
+  - Enforce recipient access, expiry, and download counts
+  - Stream encrypted downloads through an authorized route
 
-1. A temporary user enters a username and joins the website lobby. No room code or outside invite is required.
-2. The browser generates an ECDH P-256 key pair and registers only the public key with Flask.
-3. The sender selects one or more active receivers. The sender browser encrypts the file separately for each selected receiver.
-4. For each receiver, the browser generates a random AES file key and encrypts the file locally with AES-256-GCM.
-5. For each receiver, the browser creates an ephemeral ECDH key pair, derives a wrapping key with HKDF-SHA256, and wraps that AES file key to the selected receiver's public key.
-6. Flask stores only encrypted payloads, wrapped key metadata, lobby metadata, expiry time, and remaining download count.
-7. Each receiver downloads their own encrypted clip. Their browser unwraps the AES file key with their in-tab private key and decrypts the file locally.
-
-The clipboard private key only lives in the browser tab. If the tab is closed or refreshed, that temporary user cannot decrypt pending files anymore. Because usernames are still not verified identity, users should compare the displayed key fingerprint before sharing sensitive files.
-
-### How AES-GCM Works
-AES-GCM (Advanced Encryption Standard in Galois/Counter Mode) acts as both an encryption mode and an authenticator. It ensures that the file content hasn't been tampered with while simultaneously encrypting the confidentiality of the contents.
-
-During encryption, a 12-byte random nonce is generated and appended with the final encryption process that yields an Authentication Tag. We output: `[16-byte salt][12-byte nonce][ciphertext + 16-byte tag]`.
-
-### Why PBKDF2HMAC is Used
-To derive a 256-bit secure key from a human-readable password, PBKDF2HMAC (Password-Based Key Derivation Function 2) stretches the chosen password through HMAC-SHA256, alongside a 16-byte random salt, iterated 210,000 times. This provides a strong defense against dictionary and brute-force attacks.
-
-## Threat Model
-
-1. **Stolen Encrypted File**: An attacker cannot unearth the encryption key without knowing the exact chosen password and computing the costly PBKDF2 function.
-2. **File Tampering**: Because AES-GCM tags all cipher payload integrity, if an attacker flips a bit in the encrypted string to inject malicious routines, the decrypt attempt will inherently and gracefully crash via `InvalidTag`.
-3. **Cross-Site Request Forgery**: All forms natively deploy and validate standard CSRF cookies securely isolated via `Flask-WTF`.
-4. **Shared Package Exposure**: A stored clipboard clip cannot be opened without the receiver's temporary in-browser private key.
-5. **Clipboard Exposure**: A stored clipboard blob is encrypted before upload. A server compromise exposes ciphertext, public keys, sender/receiver names, timing metadata, expiry policy, and file names, but not plaintext file contents.
-
-### Security Limitations
-- Files are kept in internal application memory using `io.BytesIO` during cryptographic processing to keep raw unencrypted segments entirely decoupled from the system disk. For extreme multi-GB sizes, you must switch to chunked streaming pipelines; which is why the system caps at 20MB payload.
-- As the deployment bridges direct HTML/HTTP interactions: ensure the platform runs via HTTPS. Otherwise, credentials are exposed in cleartext transit.
-- Temporary usernames are not verified identity. Use the displayed fingerprint to confirm the intended receiver when identity matters.
-- The default rate-limit storage is in-memory. For multi-worker or multi-instance production deployments, set `RATELIMIT_STORAGE_URI` to Redis or another Flask-Limiter supported backend.
-
-## How to Run the Project
-
-1. Keep a stable Python 3.9+ runtime locally.
-2. Clone/change working directory to this application.
-3. Use pip to install constraints.
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. Start the service.
-   ```bash
-   python app.py
-   ```
-5. Navigate to `http://localhost:5000` via web browser.
-
-## Deployment
-
-This app is now ready for common Python web hosts and Docker platforms.
-
-### Required Environment Variables
-
-Set a stable secret key in production:
-
-```bash
-FLASK_SECRET_KEY=replace-with-a-long-random-secret
+Vercel services
+  - Vercel Blob stores encrypted payloads
+  - Upstash Redis stores temporary users, inboxes, shares, and counters
 ```
 
-You can generate one with:
+The server never receives plaintext files, private keys, or raw AES file keys.
 
-```bash
-python -c "import secrets; print(secrets.token_urlsafe(48))"
-```
-
-Most hosts also provide `PORT` automatically. If yours does not, set:
-
-```bash
-PORT=5000
-```
-
-Recommended production settings:
-
-```bash
-RATELIMIT_STORAGE_URI=redis://redis:6379/0
-SECURE_VAULT_DATA_DIR=/app/instance/clipboard
-SESSION_COOKIE_SECURE=true
-```
-
-### Deploy With Gunicorn
+## Local Setup
 
 Install dependencies:
 
 ```bash
-pip install -r requirements.txt
+npm install
 ```
+
+Create `.env.local`:
+
+```bash
+cp .env.example .env.local
+```
+
+For UI and API smoke tests, Redis and Blob are optional. Without Redis, the app uses in-memory local state and reports `durableStore:false` from `/api/health`.
 
 Start the app:
 
 ```bash
-gunicorn wsgi:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120
-```
-
-The included `Procfile` uses that same command for platforms that support Procfile-based Python apps.
-
-### Deploy With Docker
-
-Build the image:
-
-```bash
-docker build -t secure-vault .
-```
-
-Run it locally:
-
-```bash
-docker run --rm -p 5000:5000 -e FLASK_SECRET_KEY=replace-this secure-vault
+npm run dev
 ```
 
 Open:
 
-```bash
-http://localhost:5000
+```text
+http://127.0.0.1:3000
 ```
 
-### Hosted Platform Checklist
-
-1. Push this folder to a Git repository.
-2. Create a new Python web service or Docker web service on your host.
-3. Set `FLASK_SECRET_KEY` in the service environment.
-4. Use `pip install -r requirements.txt` as the build command for Python builds.
-5. Use the Procfile command or `gunicorn wsgi:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120` as the start command.
-6. Enable HTTPS. The public-key sharing channel uses browser Web Crypto, which requires a secure context outside localhost.
-7. For multiple Gunicorn workers or multiple app instances, configure shared `SECURE_VAULT_DATA_DIR` storage and a shared `RATELIMIT_STORAGE_URI`.
-
-Health checks can point to:
+Run production checks:
 
 ```bash
-/healthz
+npm run typecheck
+npm run build
+npm audit --audit-level=moderate
 ```
 
-## Future Improvements
+## Environment Variables
 
-- Stream-based bulk chunk proxy encryption logic.
-- Secure, hardware-based KMS wrappers or integrations.
-- Rate-limiting (via `Flask-Limiter`) for excessive decryption attempts.
-- Progress bars reflecting processing stages.
+Required for production:
+
+```text
+BLOB_READ_WRITE_TOKEN=vercel_blob_read_write_token
+UPSTASH_REDIS_REST_URL=https://your-redis-url.upstash.io
+UPSTASH_REDIS_REST_TOKEN=your_redis_rest_token
+```
+
+Optional for local callback testing:
+
+```text
+VERCEL_BLOB_CALLBACK_URL=https://your-ngrok-url
+```
+
+Legacy Flask variables in older versions are not used by the Next.js/Vercel app.
+
+## Vercel Deployment
+
+1. Create a Vercel project from this repository.
+2. Create a Vercel Blob store with **Private** access.
+3. Connect the Blob store to the project so `BLOB_READ_WRITE_TOKEN` is added.
+4. Add an Upstash Redis database from Vercel Marketplace or Upstash, then set `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`.
+5. Use the default Vercel Next.js settings:
+   - Install command: `npm install`
+   - Build command: `npm run build`
+   - Framework: Next.js
+6. Deploy.
+7. Health-check `/api/health`; production should return `durableStore:true`.
+
+If sharing shows `Vercel Blob: Failed to retrieve the client token`, the deployment is missing `BLOB_READ_WRITE_TOKEN` or the Blob store is not connected to the Vercel project. The app also checks this at login and `/api/health` reports `blobConfigured:false` when uploads are not ready.
+
+## Security Design
+
+- **Encryption in transit:** Vercel provides HTTPS in production. Browser Web Crypto also requires a secure context outside localhost.
+- **Encryption at rest:** Only AES-GCM ciphertext is stored in Blob.
+- **E2E key model:** Private ECDH keys live only in the current browser tab.
+- **Access control:** Downloads require the active recipient user ID for the clip.
+- **Recipient privacy:** The UI does not show an online user list, and the all-users route returns only the current active user. Recipient lookup is explicit search only.
+- **Private storage:** Blob reads are performed through the authorized download route using `BLOB_READ_WRITE_TOKEN`.
+- **Expiring links:** Redis metadata expires and download routes reject expired shares.
+- **Download limits:** A Redis-backed counter decrements atomically before a download is served.
+- **URL guessing prevention:** User, share, and clip IDs are high-entropy random values; Blob paths include random UUIDs and private storage blocks public reads.
+- **Input validation:** Usernames, fingerprints, public keys, metadata, recipient lists, file sizes, expiry, and download limits are validated server-side.
+- **Rate limiting:** API routes use Redis or local-memory request buckets.
+
+## Important Limitations
+
+- Temporary usernames are not verified identities. Compare displayed fingerprints through another channel for high-sensitivity transfers.
+- If a browser tab closes or refreshes, its private key is lost and pending files for that temporary identity cannot be decrypted.
+- Without Redis environment variables, local memory mode is not suitable for Vercel production.
+- Blob cleanup is opportunistic after expiry and immediate after the final allowed download. Expired Blob objects are removed when the share is touched again.
+
+## Legacy Flask Files
+
+The previous Flask implementation remains in the repository for reference, but Vercel deployment now targets the Next.js app through `package.json`, `next.config.ts`, and `vercel.json`.

@@ -1,3 +1,9 @@
+"""
+FileSn4p - Secure File Transfer Application
+Military-grade end-to-end encryption with zero-knowledge architecture
+License: MIT
+"""
+
 import json
 import logging
 import os
@@ -8,6 +14,8 @@ import time
 from io import BytesIO
 from pathlib import Path
 
+from pythonjsonlogger import jsonlogger
+
 from flask import Flask, abort, flash, jsonify, redirect, render_template, request, send_file, url_for
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -15,14 +23,17 @@ from flask_wtf.csrf import CSRFProtect
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.utils import secure_filename
 
-# crypto_utils kept for potential future use; E2E encryption is browser-side
+# FileSn4p - Secure file sharing with browser-side E2E encryption
 
-MAX_FILE_SIZE = 20 * 1024 * 1024
+MAX_FILE_SIZE = 50 * 1024 * 1024
 ACTIVE_USER_SECONDS = 45
 STALE_USER_SECONDS = 120
 MAX_ROOM_USERS = 32
-ALLOWED_EXPIRES = {300, 600, 7200, 10800}
-ALLOWED_VIEW_LIMITS = {1, 2}
+ALLOWED_EXPIRES = {600, 1200, 1800, 3600, 5400, 7200, 10800}  # 10 min to 3 hours
+MAX_VIEW_LIMIT = 1000
+MIN_VIEW_LIMIT = 10
+MAX_EXPIRY_SECONDS = 180 * 60  # 3 hours
+MIN_EXPIRY_SECONDS = 10 * 60  # 10 minutes
 ROOM_RE = re.compile(r"^[A-Z0-9]{6,32}$")
 ROOM_STRIP_RE = re.compile(r"[^A-Za-z0-9]")
 USER_RE = re.compile(r"^[A-Za-z0-9_. -]{1,32}$")
@@ -48,7 +59,10 @@ limiter = Limiter(
     storage_uri=os.environ.get("RATELIMIT_STORAGE_URI", "memory://"),
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+handler = logging.StreamHandler()
+formatter = jsonlogger.JsonFormatter('%(asctime)s %(levelname)s %(name)s %(message)s')
+handler.setFormatter(formatter)
+logging.basicConfig(handlers=[handler], level=logging.INFO)
 
 DATA_DIR = Path(os.environ.get("SECURE_VAULT_DATA_DIR", Path(app.instance_path) / "clipboard"))
 BLOB_DIR = DATA_DIR / "blobs"
@@ -263,6 +277,7 @@ def run_periodic_cleanup():
 
 @app.after_request
 def set_security_headers(response):
+    # Content Security Policy - Strict policy for security
     response.headers["Content-Security-Policy"] = (
         "default-src 'self'; "
         "script-src 'self'; "
@@ -273,13 +288,23 @@ def set_security_headers(response):
         "object-src 'none'; "
         "base-uri 'self'; "
         "form-action 'self'; "
-        "frame-ancestors 'none'"
+        "frame-ancestors 'none'; "
+        "upgrade-insecure-requests"
     )
+    
+    # Additional security headers
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Cache-Control"] = "no-store"
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, proxy-revalidate"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=(), payment=()"
+    response.headers["X-Permitted-Cross-Domain-Policies"] = "none"
+    
+    # HSTS for HTTPS enforcement
     if request.is_secure:
-        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains; preload"
+    
     return response
 
 
@@ -311,8 +336,8 @@ def not_found(error):
 def request_entity_too_large(error):
     logging.warning("Upload rejected: File size exceeded the limit.")
     if request.path.startswith("/api/"):
-        return json_error("File is too large. Maximum size is 20MB.", 413)
-    flash("File is too large. Maximum size is 20MB.", "error")
+        return json_error("File is too large. Maximum size is 50 MB.", 413)
+    flash("File is too large. Maximum size is 50 MB.", "error")
     return redirect(url_for("index")), 413
 
 
@@ -368,6 +393,13 @@ def join_room():
         ).fetchone()["count"]
         if active_count >= MAX_ROOM_USERS:
             abort(400, description="This room is full.")
+
+        existing_user = conn.execute(
+            "SELECT id FROM users WHERE room_id = ? AND username = ? AND last_seen > ?",
+            (room_id, username, timestamp - ACTIVE_USER_SECONDS)
+        ).fetchone()
+        if existing_user:
+            abort(400, description="Username is already taken in this room.")
 
         conn.execute(
             """
@@ -480,7 +512,8 @@ def search_users(room_id):
 def create_clip(room_id):
     room_id = validate_room_id(room_id)
     sender_id = request.form.get("sender_id")
-    recipient_id = request.form.get("recipient_id")
+    recipient_ids = request.form.get("recipient_id", "").split(",") if request.form.get("recipient_id") else []
+    recipient_ids = [r.strip() for r in recipient_ids if r.strip()]
     expiry_mode = request.form.get("expiry_mode", "time")
 
     try:
@@ -490,22 +523,28 @@ def create_clip(room_id):
 
     payload = request.files.get("payload")
 
+    # Validate recipients
+    if not recipient_ids or len(recipient_ids) > 50:
+        abort(400, description="Select 1-50 recipients.")
+
     # Exclusive expiry mode: only one of downloads or time is active
     if expiry_mode == "downloads":
         try:
-            views_left = int(request.form.get("view_limit") or 0)
+            views_left = int(request.form.get("view_limit") or MIN_VIEW_LIMIT)
         except (TypeError, ValueError):
-            abort(400, description="Invalid view limit.")
-        if views_left not in ALLOWED_VIEW_LIMITS:
-            abort(400, description="Unsupported view limit.")
+            abort(400, description="Invalid download limit.")
+        if not (MIN_VIEW_LIMIT <= views_left <= MAX_VIEW_LIMIT):
+            abort(400, description=f"Download limit must be between {MIN_VIEW_LIMIT} and {MAX_VIEW_LIMIT}.")
         expires_in = 30 * 24 * 3600  # 30 days — effectively infinite
     elif expiry_mode == "time":
         try:
-            expires_in = int(request.form.get("expires_in") or 0)
+            expires_in = int(request.form.get("expires_in") or MIN_EXPIRY_SECONDS)
         except (TypeError, ValueError):
             abort(400, description="Invalid expiration.")
-        if expires_in not in ALLOWED_EXPIRES:
-            abort(400, description="Unsupported expiration policy.")
+        
+        # Validate expiry is within min and max bounds
+        if not (MIN_EXPIRY_SECONDS <= expires_in <= MAX_EXPIRY_SECONDS):
+            abort(400, description=f"Expiration must be between 10 minutes and 3 hours.")
         views_left = 9999  # effectively infinite
     else:
         abort(400, description="Choose a valid expiry mode.")
@@ -517,7 +556,10 @@ def create_clip(room_id):
     size_bytes = payload.tell()
     payload.seek(0)
     if size_bytes < 1 or size_bytes > MAX_FILE_SIZE + 65536:
-        abort(400, description="Encrypted payload size is invalid.")
+        abort(400, description="Encrypted payload size is invalid. Maximum 50 MB.")
+
+    if size_bytes > MAX_FILE_SIZE:
+        abort(413, description="File size exceeds 50 MB limit.")
 
     metadata_dict = json.loads(metadata)
     original_name = secure_filename(metadata_dict.get("filename") or payload.filename) or "shared-file"
@@ -531,42 +573,66 @@ def create_clip(room_id):
             "SELECT username FROM users WHERE id = ? AND room_id = ? AND last_seen > ?",
             (sender_id, room_id, timestamp - ACTIVE_USER_SECONDS),
         ).fetchone()
-        recipient = conn.execute(
-            "SELECT id FROM users WHERE id = ? AND room_id = ? AND last_seen > ?",
-            (recipient_id, room_id, timestamp - ACTIVE_USER_SECONDS),
-        ).fetchone()
 
-        if not sender or not recipient or sender_id == recipient_id:
-            abort(400, description="Choose an active receiver in this room.")
+        if not sender:
+            abort(400, description="Sender must be active in this room.")
 
+        # Validate all recipients exist and are active
+        recipients = []
+        for recipient_id in recipient_ids:
+            recipient = conn.execute(
+                "SELECT id, username FROM users WHERE id = ? AND room_id = ? AND last_seen > ?",
+                (recipient_id, room_id, timestamp - ACTIVE_USER_SECONDS),
+            ).fetchone()
+            if not recipient or recipient_id == sender_id:
+                abort(400, description="Invalid or inactive recipient selected.")
+            recipients.append(recipient)
+
+        # Save the file once
         payload.save(stored_path)
-        conn.execute(
-            """
-            INSERT INTO clips (
-                id, room_id, sender_id, sender_name, recipient_id, original_name,
-                size_bytes, metadata_json, stored_path, created_at, expires_at,
-                views_left, deleted_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-            """,
-            (
-                clip_id,
-                room_id,
-                sender_id,
-                sender["username"],
-                recipient_id,
-                original_name,
-                size_bytes,
-                metadata,
-                stored_name,
-                timestamp,
-                timestamp + expires_in,
-                views_left,
-            ),
-        )
 
-    logging.info("Encrypted clipboard clip created: %s -> %s (%s bytes)", sender_id, recipient_id, size_bytes)
-    return jsonify({"clip_id": clip_id, "expires_at": timestamp + expires_in, "views_left": views_left})
+        # Create a clip for each recipient
+        clip_ids = []
+        for recipient in recipients:
+            clip_id = secrets.token_urlsafe(18)
+            clip_ids.append(clip_id)
+            
+            conn.execute(
+                """
+                INSERT INTO clips (
+                    id, room_id, sender_id, sender_name, recipient_id, original_name,
+                    size_bytes, metadata_json, stored_path, created_at, expires_at,
+                    views_left, deleted_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    clip_id,
+                    room_id,
+                    sender_id,
+                    sender["username"],
+                    recipient["id"],
+                    original_name,
+                    size_bytes,
+                    metadata,
+                    stored_name,
+                    timestamp,
+                    timestamp + expires_in,
+                    views_left,
+                ),
+            )
+
+        recipients_str = ", ".join([r["username"] for r in recipients])
+        logging.info("Encrypted clipboard clip created: %s -> %s (%s bytes, %d recipients)", 
+                    sender_id, recipients_str, size_bytes, len(recipients))
+
+    return jsonify({
+        "clip_ids": clip_ids,
+        "clip_count": len(clip_ids),
+        "expires_at": timestamp + expires_in,
+        "views_left": views_left,
+        "recipients": len(recipients)
+    })
 
 
 @app.route("/api/rooms/<room_id>/clips", methods=["GET"])

@@ -5,7 +5,7 @@
        CONSTANTS
        ============================================================ */
     const encoder = new TextEncoder();
-    const MAX_FILE_SIZE = 20 * 1024 * 1024;
+    const MAX_FILE_SIZE = 50 * 1024 * 1024;
     const CURVE = "P-256";
     const CURVE_BITS = 256;
     const WRAP_INFO = encoder.encode("secure-vault-live-clipboard-v1");
@@ -22,7 +22,7 @@
         publicKeyDoc: null,
         fingerprint: null,
         selectedFile: null,
-        selectedRecipient: null,
+        selectedRecipients: [],  // Changed to array for multiple recipients
         searchResults: [],
         timers: []
     };
@@ -239,8 +239,8 @@
     }
 
     function showTab(name) {
-        document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
-        document.querySelectorAll(".nav-tab").forEach((btn) => {
+        document.querySelectorAll(".tab-panel").forEach((t) => t.classList.remove("active"));
+        document.querySelectorAll(".navbar-tab").forEach((btn) => {
             btn.classList.toggle("active", btn.dataset.tab === name);
         });
         const tab = $("tab-" + name);
@@ -346,7 +346,7 @@
 
         function selectFile(file) {
             if (file.size > MAX_FILE_SIZE) {
-                alert("File is too large. Maximum size is 20 MB.");
+                showFileSizeAlert(file.name, file.size);
                 return;
             }
             state.selectedFile = file;
@@ -356,6 +356,36 @@
             zone.hidden = true;
             nextBtn.disabled = false;
         }
+    }
+
+    /* Premium file size alert modal */
+    function showFileSizeAlert(name, size) {
+        // Overlay
+        const overlay = document.createElement('div');
+        overlay.className = 'file-alert-overlay';
+        // Modal
+        const modal = document.createElement('div');
+        modal.className = 'file-alert';
+        modal.innerHTML = `
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"/>
+                <line x1="12" y1="8" x2="12" y2="12"/>
+                <line x1="12" y1="16" x2="12.01" y2="16"/>
+            </svg>
+            <h3>File Too Large</h3>
+            <p><strong>${escapeText(name)}</strong> is ${formatBytes(size)}.<br>Maximum allowed size is ${formatBytes(MAX_FILE_SIZE)}.</p>
+            <button type="button">Got it</button>
+        `;
+        document.body.appendChild(overlay);
+        document.body.appendChild(modal);
+
+        function dismiss() {
+            modal.classList.add('closing');
+            overlay.style.opacity = '0';
+            setTimeout(() => { modal.remove(); overlay.remove(); }, 260);
+        }
+        modal.querySelector('button').addEventListener('click', dismiss);
+        overlay.addEventListener('click', dismiss);
     }
 
     /* ============================================================
@@ -412,7 +442,7 @@
        TAB NAVIGATION
        ============================================================ */
     function setupTabs() {
-        document.querySelectorAll(".nav-tab").forEach((btn) => {
+        document.querySelectorAll(".navbar-tab").forEach((btn) => {
             btn.addEventListener("click", () => {
                 showTab(btn.dataset.tab);
                 if (btn.dataset.tab === "inbox") refreshInbox();
@@ -431,12 +461,12 @@
         async function doSearch() {
             const query = input.value.trim();
             if (!query) {
-                results.innerHTML = '<p class="hint">Type a username and click Search.</p>';
+                results.innerHTML = '<p class="search-hint">Type a username to search for recipients</p>';
                 return;
             }
 
             btn.disabled = true;
-            results.innerHTML = '<p class="hint">Searching...</p>';
+            results.innerHTML = '<p class="search-hint">Searching...</p>';
 
             try {
                 const res = await apiFetch(
@@ -444,11 +474,9 @@
                 );
                 const data = await res.json();
                 state.searchResults = data.users || [];
-                state.selectedRecipient = null;
-                $("btn-send").disabled = true;
                 renderSearchResults();
             } catch (err) {
-                results.innerHTML = `<p class="hint">${escapeText(err.message)}</p>`;
+                results.innerHTML = `<p class="search-hint">${escapeText(err.message)}</p>`;
             } finally {
                 btn.disabled = false;
             }
@@ -462,34 +490,78 @@
 
     function renderSearchResults() {
         const container = $("search-results");
+        const selectedRecipientsList = $("selected-recipients-list");
+        const selectedRecipientsContainer = $("selected-recipients");
         const users = state.searchResults;
 
         if (!users.length) {
-            container.innerHTML = '<p class="hint">No users found. Make sure they are online.</p>';
+            container.innerHTML = '<p class="search-hint">No users found. Make sure they are online.</p>';
             return;
         }
 
-        container.innerHTML = users.map((u) => `
-            <div class="search-result" data-user-id="${escapeText(u.id)}">
-                <div class="user-avatar">${escapeText(u.username.charAt(0).toUpperCase())}</div>
-                <div class="user-details">
-                    <div class="user-name">${escapeText(u.username)}</div>
-                    <div class="user-fp">${escapeText(u.fingerprint)}</div>
+        container.innerHTML = users.map((u) => {
+            const isSelected = state.selectedRecipients.some(r => r.id === u.id);
+            return `
+                <div class="search-result ${isSelected ? 'selected' : ''}" data-user-id="${escapeText(u.id)}">
+                    <div class="user-avatar">${escapeText(u.username.charAt(0).toUpperCase())}</div>
+                    <div class="user-details">
+                        <div class="user-name">${escapeText(u.username)}</div>
+                        <div class="user-fp">${escapeText(u.fingerprint)}</div>
+                    </div>
+                    <div class="check-icon"></div>
                 </div>
-                <div class="check-icon"></div>
-            </div>
-        `).join("");
+            `;
+        }).join("");
 
         container.querySelectorAll(".search-result").forEach((card) => {
             card.addEventListener("click", () => {
-                // Deselect all, select this one
-                container.querySelectorAll(".search-result").forEach((c) => c.classList.remove("selected"));
-                card.classList.add("selected");
+                card.classList.toggle("selected");
                 const userId = card.dataset.userId;
-                state.selectedRecipient = users.find((u) => u.id === userId) || null;
-                $("btn-send").disabled = !state.selectedRecipient;
+                const user = users.find((u) => u.id === userId);
+                
+                if (card.classList.contains("selected")) {
+                    if (!state.selectedRecipients.some(r => r.id === userId)) {
+                        state.selectedRecipients.push(user);
+                    }
+                } else {
+                    state.selectedRecipients = state.selectedRecipients.filter(r => r.id !== userId);
+                }
+                
+                updateSelectedRecipientsDisplay();
             });
         });
+    }
+
+    function updateSelectedRecipientsDisplay() {
+        const selectedRecipientsContainer = $("selected-recipients");
+        const selectedRecipientsList = $("selected-recipients-list");
+        const recipientCount = $("recipient-count");
+        
+        if (state.selectedRecipients.length === 0) {
+            selectedRecipientsContainer.hidden = true;
+            $("btn-send").disabled = true;
+        } else {
+            selectedRecipientsContainer.hidden = false;
+            recipientCount.textContent = state.selectedRecipients.length;
+            
+            selectedRecipientsList.innerHTML = state.selectedRecipients.map((r) => `
+                <div class="recipient-tag">
+                    <span>${escapeText(r.username)}</span>
+                    <button type="button" class="remove-recipient" data-user-id="${escapeText(r.id)}" title="Remove recipient">×</button>
+                </div>
+            `).join("");
+            
+            selectedRecipientsList.querySelectorAll(".remove-recipient").forEach((btn) => {
+                btn.addEventListener("click", () => {
+                    const userId = btn.dataset.userId;
+                    state.selectedRecipients = state.selectedRecipients.filter(r => r.id !== userId);
+                    renderSearchResults();
+                    updateSelectedRecipientsDisplay();
+                });
+            });
+            
+            $("btn-send").disabled = false;
+        }
     }
 
     /* ============================================================
@@ -500,33 +572,55 @@
             const status = $("send-status");
             const btn = $("btn-send");
             const file = state.selectedFile;
-            const recipient = state.selectedRecipient;
+            const recipients = state.selectedRecipients;
 
-            if (!file || !recipient || !state.keyPair) return;
+            if (!file || recipients.length === 0 || !state.keyPair) return;
 
             try {
                 btn.disabled = true;
-                setStatus(status, "Encrypting file...");
+                setStatus(status, `Encrypting file for ${recipients.length} recipient${recipients.length > 1 ? 's' : ''}...`);
 
-                const encrypted = await encryptForRecipient(file, recipient);
-                const body = new FormData();
-                body.append("sender_id", state.userId);
-                body.append("recipient_id", recipient.id);
+                // Encrypt for all recipients
+                const encryptedForRecipients = await Promise.all(
+                    recipients.map(recipient => encryptForRecipient(file, recipient))
+                );
 
-                // Expiry mode
+                // Get expiry settings
                 const mode = document.querySelector('input[name="expiry_mode"]:checked').value;
-                body.append("expiry_mode", mode);
+                let viewLimit = 10;
+                let expiresIn = 10 * 60; // default 10 minutes
+                
                 if (mode === "downloads") {
-                    body.append("view_limit", $("view-limit").value);
+                    viewLimit = parseInt($('view-limit').value, 10);
+                    if (isNaN(viewLimit) || viewLimit < 10) viewLimit = 10;
+                    if (viewLimit > 1000) viewLimit = 1000;
                 } else {
-                    body.append("expires_in", $("expire-time").value);
+                    const minutes = parseInt($("expire-minutes").value, 10);
+                    if (isNaN(minutes) || minutes < 10) expiresIn = 10 * 60;
+                    else if (minutes > 180) expiresIn = 180 * 60;
+                    else expiresIn = minutes * 60;
                 }
 
-                body.append("metadata", JSON.stringify(encrypted.metadata));
-                body.append("payload", encrypted.ciphertext, sanitizeName(file.name) + ".clip");
-
                 setStatus(status, "Uploading encrypted file...");
-                await apiFetch(`/api/rooms/${state.roomId}/clips`, { method: "POST", body });
+                
+                // Send all encrypted copies with same metadata (stored once)
+                for (const encrypted of encryptedForRecipients) {
+                    const body = new FormData();
+                    body.append("sender_id", state.userId);
+                    body.append("recipient_id", recipients.map(r => r.id).join(","));
+                    body.append("expiry_mode", mode);
+                    
+                    if (mode === "downloads") {
+                        body.append("view_limit", String(viewLimit));
+                    } else {
+                        body.append("expires_in", String(expiresIn));
+                    }
+                    
+                    body.append("metadata", JSON.stringify(encrypted.metadata));
+                    body.append("payload", encrypted.ciphertext, sanitizeName(file.name) + ".clip");
+                    
+                    await apiFetch(`/api/rooms/${state.roomId}/clips`, { method: "POST", body });
+                }
 
                 showStep("step-sent");
             } catch (err) {
@@ -644,11 +738,79 @@
         setupTabs();
         setupSearch();
         setupSend();
+        setupThemeToggle();
+
+        // Logout
+        const logoutBtn = $("btn-logout");
+        if (logoutBtn) {
+            logoutBtn.addEventListener("click", function () {
+                state.timers.forEach(function (t) { clearInterval(t); });
+                state.roomId = null;
+                state.userId = null;
+                state.keyPair = null;
+                showPage("page-login");
+            });
+        }
+
+        // Auto-dismiss notifications
+        document.querySelectorAll(".notification-close").forEach(function (btn) {
+            btn.addEventListener("click", function () {
+                btn.closest(".notification").remove();
+            });
+        });
+        document.querySelectorAll(".notification").forEach(function (n) {
+            setTimeout(function () { if (n.parentNode) n.remove(); }, 5000);
+        });
 
         // Web Crypto check
         if (!window.crypto || !window.crypto.subtle) {
             setStatus($("login-status"), "Web Crypto is unavailable. Use localhost or HTTPS.", "error");
         }
+    }
+
+    /* ============================================================
+       THEME TOGGLE
+       ============================================================ */
+    function setupThemeToggle() {
+        const btn = $('theme-toggle');
+        if (!btn) return;
+        const moon = $('icon-moon');
+        const sun = $('icon-sun');
+        const root = document.documentElement;
+        const loginLogo = $('login-logo');
+        const navbarLogo = $('navbar-logo');
+
+        function updateLogos(theme) {
+            if (loginLogo) {
+                loginLogo.src = theme === 'light' ? 
+                    '/static/logo-light.svg' : '/static/logo-dark.svg';
+            }
+            if (navbarLogo) {
+                navbarLogo.src = theme === 'light' ? 
+                    '/static/logo-light.svg' : '/static/logo-dark.svg';
+            }
+        }
+
+        // Restore saved preference
+        const saved = localStorage.getItem('filesn4p-theme');
+        if (saved === 'light') {
+            root.setAttribute('data-theme', 'light');
+            updateLogos('light');
+            if (moon) moon.style.display = 'none';
+            if (sun) sun.style.display = '';
+        } else {
+            updateLogos('dark');
+        }
+
+        btn.addEventListener('click', () => {
+            const current = root.getAttribute('data-theme');
+            const next = current === 'dark' ? 'light' : 'dark';
+            root.setAttribute('data-theme', next);
+            localStorage.setItem('filesn4p-theme', next);
+            updateLogos(next);
+            if (moon) moon.style.display = next === 'dark' ? '' : 'none';
+            if (sun) sun.style.display = next === 'light' ? '' : 'none';
+        });
     }
 
     init();

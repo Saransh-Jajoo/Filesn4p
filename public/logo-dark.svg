@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 96" role="img" aria-labelledby="title desc">
+  <title id="title">FileSn4p dark theme logo</title>
+  <desc id="desc">File icon with FileSn4p wordmark optimized for dark backgrounds.</desc>
+  <defs>
+    <linearGradient id="paperDark" x1="20" y1="8" x2="76" y2="88" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#EAF6FF"/>
+      <stop offset="1" stop-color="#BFD8EA"/>
+    </linearGradient>
+    <linearGradient id="markDark" x1="12" y1="12" x2="88" y2="84" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#5DD6FF"/>
+      <stop offset=".52" stop-color="#37A7FF"/>
+      <stop offset="1" stop-color="#1ED6A4"/>
+    </linearGradient>
+  </defs>
+  <g>
+    <rect x="10" y="12" width="68" height="68" rx="16" fill="#111A24"/>
+    <path d="M24 10h42c6.6 0 12 5.4 12 12v42c0 6.6-5.4 12-12 12H24c-6.6 0-12-5.4-12-12V22c0-6.6 5.4-12 12-12Z" fill="url(#markDark)" opacity=".24"/>
+    <path d="M30 20h28l16 16v38H30V20Z" fill="url(#paperDark)"/>
+    <path d="M58 20v16h16" fill="#89B8D8"/>
+    <path d="M40 48h24M40 58h19" stroke="#1C3142" stroke-width="5" stroke-linecap="round"/>
+    <path d="M22 18h10v10H22zM12 34h10v10H12zM32 30h8v8h-8z" fill="#EAF6FF"/>
+  </g>
+  <text x="104" y="62" fill="#F2F7FA" font-family="Inter, Arial, sans-serif" font-size="46" font-weight="800" letter-spacing="2">FILESN</text>
+  <text x="278" y="62" fill="#9DC5DA" font-family="Inter, Arial, sans-serif" font-size="46" font-weight="900" letter-spacing="2">4P</text>
+</svg>
+

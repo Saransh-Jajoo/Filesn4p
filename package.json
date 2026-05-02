@@ -1,0 +1,36 @@
+{
+  "name": "filesn4p",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Production-ready encrypted file sharing app for Vercel.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@upstash/redis": "1.37.0",
+    "@vercel/blob": "2.3.3",
+    "framer-motion": "12.38.0",
+    "lucide-react": "0.554.0",
+    "next": "16.2.4",
+    "react": "19.2.1",
+    "react-dom": "19.2.1"
+  },
+  "overrides": {
+    "postcss": "8.5.13"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "@types/react": "19.2.7",
+    "@types/react-dom": "19.2.3",
+    "eslint": "9.39.1",
+    "eslint-config-next": "16.2.4",
+    "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}
