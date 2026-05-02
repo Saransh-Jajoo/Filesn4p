@@ -616,7 +616,7 @@ export default function SecureShareApp() {
                     value={username}
                     onChange={(event) => setUsername(event.target.value)}
                     maxLength={32}
-                    pattern="[A-Za-z0-9_. -]{1,32}"
+                    pattern="[A-Za-z0-9_.\- ]{1,32}"
                     autoComplete="nickname"
                     required
                   />

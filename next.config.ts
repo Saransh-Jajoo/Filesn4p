@@ -16,7 +16,7 @@ const nextConfig: NextConfig = {
               "style-src 'self' 'unsafe-inline'",
               "img-src 'self' data:",
               "font-src 'self'",
-              "connect-src 'self' https://blob.vercel-storage.com https://*.blob.vercel-storage.com",
+              "connect-src 'self' https://vercel.com https://blob.vercel-storage.com https://*.blob.vercel-storage.com",
               "object-src 'none'",
               "base-uri 'self'",
               "form-action 'self'",
