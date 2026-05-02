@@ -456,7 +456,7 @@ export default function SecureShareApp() {
       setStatus({ text: "Uploading encrypted payload..." });
       const pathname = `clips/${session.roomId}/${crypto.randomUUID()}-${sanitizeName(selectedFile.name)}.bin`;
       const blob = await upload(pathname, encrypted.encryptedBlob, {
-        access: "private",
+        access: "public",
         handleUploadUrl: "/api/upload",
         clientPayload: JSON.stringify({ roomId: session.roomId, userId: session.userId })
       });
