@@ -1204,3 +1204,69 @@ input:focus-visible {
     padding: 20px 16px;
   }
 }
+
+/* New UI elements for clipboard, multi-file, deletion triggers */
+
+.unknown-warning {
+  color: var(--warn);
+  font-size: 0.78rem;
+  font-style: italic;
+}
+
+.field-label {
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+
+.file-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+textarea.input {
+  width: 100%;
+  min-height: 80px;
+  height: auto;
+  padding: 10px 14px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--control);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  transition:
+    border-color 160ms ease,
+    background 160ms ease;
+}
+
+textarea.input:hover {
+  border-color: var(--border-strong);
+  background: var(--control-hover);
+}
+
+textarea.input:focus {
+  outline: none;
+  box-shadow: var(--focus);
+  border-color: var(--accent);
+}
+
+/* 3-column policy switch for content type and deletion trigger */
+.policy-switch[aria-label="Content type"],
+.policy-switch[aria-label="Deletion trigger"] {
+  grid-template-columns: 1fr 1fr 1fr;
+}
+
+.policy-switch[aria-label="Deletion trigger"] {
+  grid-template-columns: 1fr 1fr 1fr 1fr;
+}
+
+.policy-choice svg {
+  vertical-align: middle;
+  margin-right: 4px;
+}

@@ -21,6 +21,17 @@ export const viewport: Viewport = {
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en" suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{
+          __html: `
+            (function() {
+              const saved = localStorage.getItem('filesn4p-theme');
+              const theme = saved || 'dark';
+              document.documentElement.dataset.theme = theme;
+            })();
+          `
+        }} />
+      </head>
       <body>{children}</body>
     </html>
   );

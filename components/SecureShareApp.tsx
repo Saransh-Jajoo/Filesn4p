@@ -6,7 +6,11 @@ import {
   AlertCircle,
   ArrowLeft,
   Check,
+  Clipboard,
+  Clock,
+  Copy,
   Download,
+  Eye,
   FileText,
   Inbox,
   LogOut,
@@ -24,10 +28,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CLIP_TYPE,
   CURVE,
+  MAX_CLIPBOARD_TEXT_BYTES,
+  MAX_DOWNLOAD_LIMIT,
   MAX_EXPIRY_SECONDS,
   MAX_FILE_SIZE_BYTES,
   PUBLIC_KEY_TYPE
 } from "@/lib/constants";
+import type { ContentType, DeletionTrigger } from "@/lib/constants";
 import type { InboxClip, PublicKeyDoc, RecipientMetadata } from "@/lib/types";
 
 type Theme = "light" | "dark";
@@ -182,12 +189,47 @@ async function deriveWrapKey(privateKey: CryptoKey, publicKey: CryptoKey, salt: 
   );
 }
 
-async function encryptForShare(file: File, recipients: User[], session: Session, identity: Identity) {
+async function encryptForShare(files: File[], clipboardText: string | undefined, recipients: User[], session: Session, identity: Identity) {
   const fileKey = await subtleCrypto().generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
   const fileNonce = randomBytes(12);
-  const plaintext = await file.arrayBuffer();
-  const ciphertext = await subtleCrypto().encrypt({ name: "AES-GCM", iv: fileNonce }, fileKey, plaintext);
+
+  const fileInfos = files.map((f) => ({ name: sanitizeName(f.name), sizeBytes: f.size }));
+  let encryptedBlob: Blob;
+
+  if (files.length > 0) {
+    // Build plaintext: [4-byte manifest length][manifest JSON][file1 bytes][file2 bytes]...
+    const manifest = JSON.stringify({ version: 1, files: fileInfos });
+    const manifestBytes = encoder.encode(manifest);
+    const prefix = new Uint8Array(4);
+    new DataView(prefix.buffer).setUint32(0, manifestBytes.length, false);
+
+    const fileBuffers = await Promise.all(files.map((f) => f.arrayBuffer()));
+    const totalSize = prefix.length + manifestBytes.length + fileBuffers.reduce((sum, buf) => sum + buf.byteLength, 0);
+    const plaintext = new Uint8Array(totalSize);
+    let offset = 0;
+    plaintext.set(prefix, offset); offset += prefix.length;
+    plaintext.set(manifestBytes, offset); offset += manifestBytes.length;
+    for (const buf of fileBuffers) {
+      plaintext.set(new Uint8Array(buf), offset); offset += buf.byteLength;
+    }
+
+    const ciphertext = await subtleCrypto().encrypt({ name: "AES-GCM", iv: fileNonce }, fileKey, exactArrayBuffer(plaintext));
+    encryptedBlob = new Blob([ciphertext], { type: "application/octet-stream" });
+  } else {
+    encryptedBlob = new Blob([], { type: "application/octet-stream" });
+  }
+
   const rawFileKey = await subtleCrypto().exportKey("raw", fileKey);
+
+  // Encrypt clipboard text with same key, separate nonce
+  let clipboardCipherNonce: Uint8Array | undefined;
+  let clipboardTextEncrypted: string | undefined;
+  if (clipboardText) {
+    clipboardCipherNonce = randomBytes(12);
+    const clipPlaintext = encoder.encode(clipboardText);
+    const clipCiphertext = await subtleCrypto().encrypt({ name: "AES-GCM", iv: exactArrayBuffer(clipboardCipherNonce) }, fileKey, exactArrayBuffer(clipPlaintext));
+    clipboardTextEncrypted = toBase64(clipCiphertext);
+  }
 
   const recipientMetadata = await Promise.all(
     recipients.map(async (recipient) => {
@@ -204,13 +246,16 @@ async function encryptForShare(file: File, recipients: User[], session: Session,
         version: 1,
         algorithm: "ECDH-HKDF-SHA256-AES-256-GCM",
         curve: CURVE,
-        filename: sanitizeName(file.name),
+        filename: fileInfos.length === 1 ? fileInfos[0].name : "shared-files.bin",
+        files: fileInfos.length > 1 ? fileInfos : undefined,
+        hasClipboard: !!clipboardText,
         sender: { username: session.username, fingerprint: identity.fingerprint },
         recipient: { username: recipient.username, fingerprint: recipient.fingerprint },
         ephemeralPublicKey: { format: "spki", data: toBase64(ephemeralPublic) },
         kdf: { name: "HKDF", hash: "SHA-256", salt: toBase64(wrapSalt), info: toBase64(WRAP_INFO) },
         wrappedKey: { name: "AES-GCM", nonce: toBase64(wrapNonce), data: toBase64(wrappedKey) },
-        cipher: { name: "AES-GCM", nonce: toBase64(fileNonce) }
+        cipher: { name: "AES-GCM", nonce: toBase64(fileNonce) },
+        clipboardCipher: clipboardCipherNonce ? { name: "AES-GCM", nonce: toBase64(clipboardCipherNonce) } : undefined
       };
 
       return { id: recipient.id, metadata };
@@ -218,12 +263,19 @@ async function encryptForShare(file: File, recipients: User[], session: Session,
   );
 
   return {
-    encryptedBlob: new Blob([ciphertext], { type: "application/octet-stream" }),
-    recipients: recipientMetadata
+    encryptedBlob,
+    recipients: recipientMetadata,
+    clipboardTextEncrypted,
+    fileInfos
   };
 }
 
-async function decryptClip(metadata: RecipientMetadata, encrypted: ArrayBuffer, identity: Identity) {
+type DecryptedPayload = {
+  files: Array<{ name: string; data: ArrayBuffer }>;
+  clipboardText?: string;
+};
+
+async function decryptClip(metadata: RecipientMetadata, encrypted: ArrayBuffer, identity: Identity, clipboardEncrypted?: string): Promise<DecryptedPayload> {
   if (metadata.type !== CLIP_TYPE || metadata.curve !== CURVE) throw new Error("Encrypted file metadata is invalid.");
   const senderPublic = await subtleCrypto().importKey(
     "spki",
@@ -239,7 +291,42 @@ async function decryptClip(metadata: RecipientMetadata, encrypted: ArrayBuffer, 
     fromBase64(metadata.wrappedKey.data)
   );
   const fileKey = await subtleCrypto().importKey("raw", rawFileKey, { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
-  return subtleCrypto().decrypt({ name: "AES-GCM", iv: fromBase64(metadata.cipher.nonce) }, fileKey, encrypted);
+
+  // If no file payload (clipboard-only), skip file decryption
+  if (!encrypted.byteLength) {
+    let clipboardText: string | undefined;
+    if (metadata.hasClipboard && metadata.clipboardCipher && clipboardEncrypted) {
+      const clipCiphertext = fromBase64(clipboardEncrypted);
+      const clipPlaintext = await subtleCrypto().decrypt({ name: "AES-GCM", iv: fromBase64(metadata.clipboardCipher.nonce) }, fileKey, clipCiphertext);
+      clipboardText = decoder.decode(clipPlaintext);
+    }
+    return { files: [], clipboardText };
+  }
+
+  const plaintext = await subtleCrypto().decrypt({ name: "AES-GCM", iv: fromBase64(metadata.cipher.nonce) }, fileKey, encrypted);
+  const bytes = new Uint8Array(plaintext);
+
+  // Parse manifest: [4-byte length][manifest JSON][file data...]
+  const manifestLen = new DataView(bytes.buffer, bytes.byteOffset, 4).getUint32(0, false);
+  const manifestJson = decoder.decode(bytes.slice(4, 4 + manifestLen));
+  const manifest = JSON.parse(manifestJson) as { version: number; files: Array<{ name: string; sizeBytes: number }> };
+
+  let fileOffset = 4 + manifestLen;
+  const files = manifest.files.map((f) => {
+    const data = bytes.slice(fileOffset, fileOffset + f.sizeBytes).buffer;
+    fileOffset += f.sizeBytes;
+    return { name: f.name, data };
+  });
+
+  // Decrypt clipboard text if present
+  let clipboardText: string | undefined;
+  if (metadata.hasClipboard && metadata.clipboardCipher && clipboardEncrypted) {
+    const clipCiphertext = fromBase64(clipboardEncrypted);
+    const clipPlaintext = await subtleCrypto().decrypt({ name: "AES-GCM", iv: fromBase64(metadata.clipboardCipher.nonce) }, fileKey, clipCiphertext);
+    clipboardText = decoder.decode(clipPlaintext);
+  }
+
+  return { files, clipboardText };
 }
 
 function downloadBuffer(buffer: ArrayBuffer, filename: string) {
@@ -259,6 +346,12 @@ function errorMessage(error: unknown) {
   if (message.toLowerCase().includes("failed to retrieve the client token")) {
     return "Upload token could not be created. In Vercel, connect a Blob store, set BLOB_READ_WRITE_TOKEN, set Redis env variables, then redeploy.";
   }
+  if (error instanceof DOMException && error.name === "AbortError") {
+    return "Upload timed out. Check your internet connection and try again.";
+  }
+  if (message.toLowerCase().includes("request was aborted")) {
+    return "Upload timed out. Check your internet connection and try again.";
+  }
   return message;
 }
 
@@ -271,10 +364,13 @@ export default function SecureShareApp() {
   const [tab, setTab] = useState<Tab>("send");
   const [step, setStep] = useState<Step>("file");
   const [dragging, setDragging] = useState(false);
-  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [selectedFiles, setSelectedFiles] = useState<File[]>([]);
+  const [clipboardText, setClipboardText] = useState("");
+  const [contentType, setContentType] = useState<ContentType>("file");
+  const [deletionTrigger, setDeletionTrigger] = useState<DeletionTrigger>("download");
   const [expiryMode, setExpiryMode] = useState<ExpiryMode>("downloads");
   const [downloadLimit, setDownloadLimit] = useState("1");
-  const [expiryMinutes, setExpiryMinutes] = useState("1");
+  const [expirySeconds, setExpirySeconds] = useState("3600");
   const [searchQuery, setSearchQuery] = useState("");
   const [hasSearched, setHasSearched] = useState(false);
   const [searchResults, setSearchResults] = useState<User[]>([]);
@@ -286,6 +382,7 @@ export default function SecureShareApp() {
 
   const logo = theme === "light" ? "/logo-light.svg" : "/logo-dark.svg";
   const selectedIds = useMemo(() => new Set(selectedRecipients.map((recipient) => recipient.id)), [selectedRecipients]);
+  const totalFileSize = useMemo(() => selectedFiles.reduce((sum, f) => sum + f.size, 0), [selectedFiles]);
 
   useEffect(() => {
     const saved = window.localStorage.getItem("filesn4p-theme") as Theme | null;
@@ -376,10 +473,23 @@ export default function SecureShareApp() {
     }
   };
 
-  const logout = () => {
+  const logout = async () => {
+    if (session) {
+      try {
+        await apiJson(`/api/rooms/${session.roomId}/logout`, {
+          method: "POST",
+          body: JSON.stringify({ userId: session.userId, purgeData: true })
+        });
+      } catch {
+        // Best-effort — continue clearing local state
+      }
+    }
     setSession(null);
     setIdentity(null);
-    setSelectedFile(null);
+    setSelectedFiles([]);
+    setClipboardText("");
+    setContentType("file");
+    setDeletionTrigger("download");
     setSelectedRecipients([]);
     setSearchResults([]);
     setInbox([]);
@@ -388,13 +498,26 @@ export default function SecureShareApp() {
     setStatus({ text: "" });
   };
 
-  const chooseFile = (file: File) => {
-    if (file.size > MAX_FILE_SIZE_BYTES) {
-      setAlertFile({ name: file.name, size: file.size });
-      return;
+  const addFiles = (newFiles: FileList | File[]) => {
+    const additions = Array.from(newFiles);
+    const updated = [...selectedFiles];
+    for (const file of additions) {
+      if (file.size > MAX_FILE_SIZE_BYTES) {
+        setAlertFile({ name: file.name, size: file.size });
+        continue;
+      }
+      const newSize = updated.reduce((sum, f) => sum + f.size, 0) + file.size;
+      if (newSize > MAX_FILE_SIZE_BYTES) {
+        setAlertFile({ name: file.name, size: newSize });
+        continue;
+      }
+      updated.push(file);
     }
-    setSelectedFile(file);
-    setStep("file");
+    setSelectedFiles(updated);
+  };
+
+  const removeFile = (index: number) => {
+    setSelectedFiles((prev) => prev.filter((_, i) => i !== index));
   };
 
   const searchRecipients = async () => {
@@ -431,35 +554,73 @@ export default function SecureShareApp() {
   };
 
   const sendFile = async () => {
-    if (!session || !identity || !selectedFile || selectedRecipients.length === 0) return;
-    if (!session.blobConfigured) {
+    if (!session || !identity) return;
+    const hasFiles = selectedFiles.length > 0;
+    const hasClipboard = !!clipboardText.trim();
+    if (!hasFiles && !hasClipboard) {
+      setStatus({ text: "Add at least one file or clipboard text.", kind: "error" });
+      return;
+    }
+    if (selectedRecipients.length === 0) {
+      setStatus({ text: "Select at least one recipient.", kind: "error" });
+      return;
+    }
+    if (hasFiles && !session.blobConfigured) {
       setStatus({ text: "File uploads are not configured. Add BLOB_READ_WRITE_TOKEN from your Vercel Blob store.", kind: "error" });
       return;
     }
 
     const parsedDownloadLimit = Number(downloadLimit);
-    const parsedExpiry = Number(expiryMinutes);
-    if (expiryMode === "downloads" && (!Number.isSafeInteger(parsedDownloadLimit) || parsedDownloadLimit < 1)) {
-      setStatus({ text: "Download limit must be at least 1.", kind: "error" });
+    const parsedExpiry = Number(expirySeconds);
+    if (expiryMode === "downloads" && (!Number.isSafeInteger(parsedDownloadLimit) || parsedDownloadLimit < 1 || parsedDownloadLimit > MAX_DOWNLOAD_LIMIT)) {
+      setStatus({ text: `Download limit must be between 1 and ${MAX_DOWNLOAD_LIMIT}.`, kind: "error" });
       return;
     }
-    if (expiryMode === "time" && (!Number.isInteger(parsedExpiry) || parsedExpiry < 1 || parsedExpiry > 180)) {
-      setStatus({ text: "Expiry must be between 1 and 180 minutes.", kind: "error" });
+    if (expiryMode === "time" && (!Number.isInteger(parsedExpiry) || parsedExpiry < 60 || parsedExpiry > MAX_EXPIRY_SECONDS)) {
+      setStatus({ text: `Expiry must be between 1 minute and ${MAX_EXPIRY_SECONDS / 3600} hours.`, kind: "error" });
       return;
     }
+    if ((deletionTrigger === "download" || deletionTrigger === "open" || deletionTrigger === "copy") && expiryMode !== "downloads") {
+      setStatus({ text: "Download/Open/Copy deletion requires Downloads mode.", kind: "error" });
+      return;
+    }
+    if (deletionTrigger === "time" && expiryMode !== "time") {
+      setStatus({ text: "Time deletion requires Time mode.", kind: "error" });
+      return;
+    }
+
+    const effectiveContentType: ContentType = hasFiles && hasClipboard ? "both" : hasClipboard ? "clipboard" : "file";
 
     setBusy(true);
     try {
       setStatus({ text: `Encrypting for ${selectedRecipients.length} recipient${selectedRecipients.length === 1 ? "" : "s"}...` });
-      const encrypted = await encryptForShare(selectedFile, selectedRecipients, session, identity);
+      const clipText = hasClipboard ? clipboardText.trim() : undefined;
+      const encrypted = await encryptForShare(selectedFiles, clipText, selectedRecipients, session, identity);
 
-      setStatus({ text: "Uploading encrypted payload..." });
-      const pathname = `clips/${session.roomId}/${crypto.randomUUID()}-${sanitizeName(selectedFile.name)}.bin`;
-      const blob = await upload(pathname, encrypted.encryptedBlob, {
-        access: "public",
-        handleUploadUrl: "/api/upload",
-        clientPayload: JSON.stringify({ roomId: session.roomId, userId: session.userId })
-      });
+      let blobUrl = "";
+      let blobDownloadUrl: string | undefined;
+      let blobPathname = "";
+
+      if (hasFiles) {
+        setStatus({ text: "Uploading encrypted payload..." });
+        const pathname = `clips/${session.roomId}/${crypto.randomUUID()}-${sanitizeName(selectedFiles[0].name)}.bin`;
+        const uploadController = new AbortController();
+        const uploadTimeout = window.setTimeout(() => uploadController.abort(), 120_000);
+        let blob;
+        try {
+          blob = await upload(pathname, encrypted.encryptedBlob, {
+            access: "private",
+            handleUploadUrl: "/api/upload",
+            clientPayload: JSON.stringify({ roomId: session.roomId, userId: session.userId }),
+            abortSignal: uploadController.signal
+          });
+        } finally {
+          window.clearTimeout(uploadTimeout);
+        }
+        blobUrl = blob.url;
+        blobDownloadUrl = "downloadUrl" in blob ? blob.downloadUrl : undefined;
+        blobPathname = blob.pathname;
+      }
 
       setStatus({ text: "Registering expiring access..." });
       await apiJson(`/api/rooms/${session.roomId}/clips`, {
@@ -467,19 +628,28 @@ export default function SecureShareApp() {
         body: JSON.stringify({
           senderId: session.userId,
           recipients: encrypted.recipients,
-          originalName: selectedFile.name,
-          sizeBytes: selectedFile.size,
-          encryptedSizeBytes: encrypted.encryptedBlob.size,
-          blobUrl: blob.url,
-          blobDownloadUrl: "downloadUrl" in blob ? blob.downloadUrl : undefined,
-          blobPathname: blob.pathname,
+          contentType: effectiveContentType,
+          originalName: hasFiles ? (selectedFiles.length === 1 ? selectedFiles[0].name : `${selectedFiles.length} files`) : "clipboard",
+          files: encrypted.fileInfos,
+          clipboardTextEncrypted: encrypted.clipboardTextEncrypted,
+          sizeBytes: totalFileSize + (clipText ? new TextEncoder().encode(clipText).length : 0),
+          encryptedSizeBytes: hasFiles ? encrypted.encryptedBlob.size : 0,
+          blobUrl,
+          blobDownloadUrl,
+          blobPathname,
           expiryMode,
-          downloadLimit: expiryMode === "downloads" ? downloadLimit : String(Number.MAX_SAFE_INTEGER),
-          expiresInSeconds: expiryMode === "time" ? parsedExpiry * 60 : MAX_EXPIRY_SECONDS
+          deletionTrigger,
+          downloadLimit:
+            deletionTrigger === "download"
+              ? downloadLimit
+              : deletionTrigger === "time"
+                ? "0"
+                : "1",
+          expiresInSeconds: expiryMode === "time" ? parsedExpiry : MAX_EXPIRY_SECONDS
         })
       });
 
-      setStatus({ text: "Encrypted file sent.", kind: "success" });
+      setStatus({ text: "Encrypted content sent.", kind: "success" });
       setStep("sent");
       await refreshInbox();
     } catch (error) {
@@ -497,14 +667,49 @@ export default function SecureShareApp() {
       const response = await fetch(`/api/clips/${clip.id}/download?userId=${encodeURIComponent(session.userId)}`, { cache: "no-store" });
       if (!response.ok) {
         const data = await response.json().catch(() => null);
-        throw new Error(data?.error || "File is no longer available.");
+        throw new Error(data?.error || "Content is no longer available.");
       }
       const metadata = decodeHeaderJson<RecipientMetadata>(response.headers.get("X-Clip-Metadata"));
-      const encrypted = await response.arrayBuffer();
+      const responseContentType = response.headers.get("X-Content-Type") || "file";
+
+      let encrypted: ArrayBuffer;
+      let clipboardEncrypted: string | undefined;
+
+      if (responseContentType === "clipboard") {
+        // Clipboard-only: body is JSON
+        const body = await response.json() as { clipboardTextEncrypted?: string };
+        encrypted = new ArrayBuffer(0);
+        clipboardEncrypted = body.clipboardTextEncrypted;
+      } else {
+        encrypted = await response.arrayBuffer();
+        // For "both" mode, clipboard text is in a header
+        const clipHeader = response.headers.get("X-Clipboard-Text");
+        if (clipHeader) {
+          try {
+            clipboardEncrypted = decodeHeaderJson<string>(clipHeader);
+          } catch {
+            // Ignore malformed clipboard header
+          }
+        }
+      }
+
       setStatus({ text: "Decrypting in this browser..." });
-      const plaintext = await decryptClip(metadata, encrypted, identity);
-      downloadBuffer(plaintext, metadata.filename || clip.filename);
-      setStatus({ text: "File decrypted.", kind: "success" });
+      const result = await decryptClip(metadata, encrypted, identity, clipboardEncrypted);
+
+      // Download files
+      for (const file of result.files) {
+        downloadBuffer(file.data, file.name);
+      }
+
+      // Handle clipboard text
+      if (result.clipboardText) {
+        await navigator.clipboard.writeText(result.clipboardText).catch(() => undefined);
+      }
+
+      const parts: string[] = [];
+      if (result.files.length) parts.push(`${result.files.length} file${result.files.length > 1 ? "s" : ""} downloaded`);
+      if (result.clipboardText) parts.push("clipboard copied");
+      setStatus({ text: parts.join(", ") + ".", kind: "success" });
       await refreshInbox();
     } catch (error) {
       setStatus({ text: error instanceof Error ? error.message : "Download failed.", kind: "error" });
@@ -515,13 +720,16 @@ export default function SecureShareApp() {
   };
 
   const resetSend = () => {
-    setSelectedFile(null);
+    setSelectedFiles([]);
+    setClipboardText("");
+    setContentType("file");
+    setDeletionTrigger("download");
     setSelectedRecipients([]);
     setSearchResults([]);
     setSearchQuery("");
     setExpiryMode("downloads");
     setDownloadLimit("1");
-    setExpiryMinutes("1");
+    setExpirySeconds("3600");
     setStep("file");
     setStatus({ text: "" });
     if (inputRef.current) inputRef.current.value = "";
@@ -599,7 +807,14 @@ export default function SecureShareApp() {
                     <UploadCloud size={22} />
                     <div>
                       <strong>Self-destructing access</strong>
-                      <span>Choose either a download limit or a time limit from 1 minute to 3 hours.</span>
+                      <span>Choose a download limit (up to 5) or a time limit (up to 4 hours). Delete after open, copy, download, or time.</span>
+                    </div>
+                  </div>
+                  <div className="feature-row">
+                    <Clipboard size={22} />
+                    <div>
+                      <strong>Clipboard sharing</strong>
+                      <span>Share text clips alongside or instead of files, with the same encryption and expiry rules.</span>
                     </div>
                   </div>
                 </div>
@@ -673,63 +888,184 @@ export default function SecureShareApp() {
                         <>
                           <div className="section-heading">
                             <div>
-                              <h2>Select File</h2>
-                              <p>Set the download count and expiry before choosing recipients.</p>
+                              <h2>Select Content</h2>
+                              <p>Add files and/or clipboard text to share.</p>
                             </div>
                             <span className="step-badge">1</span>
                           </div>
 
-                          {!selectedFile ? (
-                            <div
-                              className={`upload-zone ${dragging ? "dragging" : ""}`}
-                              role="button"
-                              tabIndex={0}
-                              onClick={() => inputRef.current?.click()}
-                              onKeyDown={(event) => {
-                                if (event.key === "Enter" || event.key === " ") inputRef.current?.click();
-                              }}
-                              onDragOver={(event) => {
-                                event.preventDefault();
-                                setDragging(true);
-                              }}
-                              onDragLeave={() => setDragging(false)}
-                              onDrop={(event) => {
-                                event.preventDefault();
-                                setDragging(false);
-                                const file = event.dataTransfer.files.item(0);
-                                if (file) chooseFile(file);
-                              }}
-                            >
-                              <div className="upload-zone-inner">
-                                <UploadCloud size={34} />
-                                <strong>Drop a file here</strong>
-                                <span className="muted">Maximum {formatBytes(MAX_FILE_SIZE_BYTES)}</span>
-                              </div>
-                              <input
-                                ref={inputRef}
-                                hidden
-                                type="file"
-                                onChange={(event) => {
-                                  const file = event.target.files?.item(0);
-                                  if (file) chooseFile(file);
-                                }}
-                              />
-                            </div>
-                          ) : (
-                            <div className="file-card">
-                              <span className="file-icon">
-                                <FileText size={22} />
-                              </span>
-                              <div className="file-meta">
-                                <strong>{selectedFile.name}</strong>
-                                <span>{formatBytes(selectedFile.size)}</span>
-                              </div>
-                              <button className="icon-button" type="button" onClick={() => setSelectedFile(null)} aria-label="Remove file">
-                                <X size={18} />
+                          {/* Content type selector */}
+                          <div className="policy-box">
+                            <div className="policy-switch" role="radiogroup" aria-label="Content type">
+                              <button
+                                className={`policy-choice ${contentType === "file" ? "active" : ""}`}
+                                type="button"
+                                role="radio"
+                                aria-checked={contentType === "file"}
+                                onClick={() => setContentType("file")}
+                              >
+                                <FileText size={14} />
+                                Files
                               </button>
+                              <button
+                                className={`policy-choice ${contentType === "clipboard" ? "active" : ""}`}
+                                type="button"
+                                role="radio"
+                                aria-checked={contentType === "clipboard"}
+                                onClick={() => setContentType("clipboard")}
+                              >
+                                <Clipboard size={14} />
+                                Clipboard
+                              </button>
+                              <button
+                                className={`policy-choice ${contentType === "both" ? "active" : ""}`}
+                                type="button"
+                                role="radio"
+                                aria-checked={contentType === "both"}
+                                onClick={() => setContentType("both")}
+                              >
+                                <FileText size={14} />
+                                +
+                                <Clipboard size={14} />
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* File upload zone */}
+                          {(contentType === "file" || contentType === "both") && (
+                            <>
+                              <div
+                                className={`upload-zone ${dragging ? "dragging" : ""}`}
+                                role="button"
+                                tabIndex={0}
+                                onClick={() => inputRef.current?.click()}
+                                onKeyDown={(event) => {
+                                  if (event.key === "Enter" || event.key === " ") inputRef.current?.click();
+                                }}
+                                onDragOver={(event) => {
+                                  event.preventDefault();
+                                  setDragging(true);
+                                }}
+                                onDragLeave={() => setDragging(false)}
+                                onDrop={(event) => {
+                                  event.preventDefault();
+                                  setDragging(false);
+                                  if (event.dataTransfer.files.length) addFiles(event.dataTransfer.files);
+                                }}
+                              >
+                                <div className="upload-zone-inner">
+                                  <UploadCloud size={34} />
+                                  <strong>Drop files here</strong>
+                                  <span className="muted">Max {formatBytes(MAX_FILE_SIZE_BYTES)} total | {selectedFiles.length} file{selectedFiles.length === 1 ? "" : "s"} selected</span>
+                                </div>
+                                <input
+                                  ref={inputRef}
+                                  hidden
+                                  type="file"
+                                  multiple
+                                  onChange={(event) => {
+                                    if (event.target.files?.length) addFiles(event.target.files);
+                                  }}
+                                />
+                              </div>
+
+                              {selectedFiles.length > 0 && (
+                                <div className="file-list">
+                                  {selectedFiles.map((file, index) => (
+                                    <div className="file-card" key={`${file.name}-${index}`}>
+                                      <span className="file-icon"><FileText size={22} /></span>
+                                      <div className="file-meta">
+                                        <strong>{file.name}</strong>
+                                        <span>{formatBytes(file.size)}</span>
+                                      </div>
+                                      <button className="icon-button" type="button" onClick={() => removeFile(index)} aria-label={`Remove ${file.name}`}>
+                                        <X size={18} />
+                                      </button>
+                                    </div>
+                                  ))}
+                                  <p className="hint-text">Total: {formatBytes(totalFileSize)} / {formatBytes(MAX_FILE_SIZE_BYTES)}</p>
+                                </div>
+                              )}
+                            </>
+                          )}
+
+                          {/* Clipboard text area */}
+                          {(contentType === "clipboard" || contentType === "both") && (
+                            <div className="field">
+                              <label htmlFor="clipboardText">Clipboard Text</label>
+                              <textarea
+                                id="clipboardText"
+                                className="input"
+                                rows={4}
+                                maxLength={MAX_CLIPBOARD_TEXT_BYTES}
+                                value={clipboardText}
+                                onChange={(event) => setClipboardText(event.target.value)}
+                                placeholder="Enter text to share via clipboard..."
+                              />
+                              <p className="hint-text">{clipboardText.length > 0 ? `${formatBytes(new TextEncoder().encode(clipboardText).length)}` : `Max ${MAX_CLIPBOARD_TEXT_BYTES / 1024} KB`}</p>
                             </div>
                           )}
 
+                          {/* Deletion trigger */}
+                          <div className="policy-box">
+                            <label className="field-label">Delete after</label>
+                            <div className="policy-switch" role="radiogroup" aria-label="Deletion trigger">
+                              <button
+                                className={`policy-choice ${deletionTrigger === "download" ? "active" : ""}`}
+                                type="button"
+                                role="radio"
+                                aria-checked={deletionTrigger === "download"}
+                                onClick={() => {
+                                  setDeletionTrigger("download");
+                                  setExpiryMode("downloads");
+                                }}
+                              >
+                                <Download size={14} />
+                                Download
+                              </button>
+                              <button
+                                className={`policy-choice ${deletionTrigger === "open" ? "active" : ""}`}
+                                type="button"
+                                role="radio"
+                                aria-checked={deletionTrigger === "open"}
+                                onClick={() => {
+                                  setDeletionTrigger("open");
+                                  setExpiryMode("downloads");
+                                }}
+                              >
+                                <Eye size={14} />
+                                Open
+                              </button>
+                              <button
+                                className={`policy-choice ${deletionTrigger === "copy" ? "active" : ""}`}
+                                type="button"
+                                role="radio"
+                                aria-checked={deletionTrigger === "copy"}
+                                onClick={() => {
+                                  setDeletionTrigger("copy");
+                                  setExpiryMode("downloads");
+                                }}
+                              >
+                                <Copy size={14} />
+                                Copy
+                              </button>
+                              <button
+                                className={`policy-choice ${deletionTrigger === "time" ? "active" : ""}`}
+                                type="button"
+                                role="radio"
+                                aria-checked={deletionTrigger === "time"}
+                                onClick={() => {
+                                  setDeletionTrigger("time");
+                                  setExpiryMode("time");
+                                }}
+                              >
+                                <Clock size={14} style={{ display: "inline", verticalAlign: "middle" }} />
+                                Time
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Expiry policy */}
                           <div className="policy-box">
                             <div className="policy-switch" role="radiogroup" aria-label="Expiry policy">
                               <button
@@ -737,7 +1073,10 @@ export default function SecureShareApp() {
                                 type="button"
                                 role="radio"
                                 aria-checked={expiryMode === "downloads"}
-                                onClick={() => setExpiryMode("downloads")}
+                                onClick={() => {
+                                  setExpiryMode("downloads");
+                                  if (deletionTrigger === "time") setDeletionTrigger("download");
+                                }}
                               >
                                 Downloads
                               </button>
@@ -746,7 +1085,10 @@ export default function SecureShareApp() {
                                 type="button"
                                 role="radio"
                                 aria-checked={expiryMode === "time"}
-                                onClick={() => setExpiryMode("time")}
+                                onClick={() => {
+                                  setExpiryMode("time");
+                                  if (deletionTrigger !== "time") setDeletionTrigger("time");
+                                }}
                               >
                                 Time
                               </button>
@@ -760,33 +1102,34 @@ export default function SecureShareApp() {
                                   className="number-input"
                                   value={downloadLimit}
                                   min={1}
+                                  max={MAX_DOWNLOAD_LIMIT}
                                   step={1}
                                   inputMode="numeric"
                                   type="number"
                                   onChange={(event) => setDownloadLimit(event.target.value)}
                                 />
-                                <p className="hint-text">Minimum 1. File access ends after this many downloads.</p>
+                                <p className="hint-text">1 to {MAX_DOWNLOAD_LIMIT} downloads. Access ends after this many.</p>
                               </div>
                             ) : (
                               <div className="field">
-                                <label htmlFor="expiryMinutes">Expiry time</label>
+                                <label htmlFor="expirySeconds">Expiry time (seconds)</label>
                                 <input
-                                  id="expiryMinutes"
+                                  id="expirySeconds"
                                   className="number-input"
-                                  value={expiryMinutes}
-                                  min={1}
-                                  max={180}
-                                  step={1}
+                                  value={expirySeconds}
+                                  min={60}
+                                  max={MAX_EXPIRY_SECONDS}
+                                  step={60}
                                   inputMode="numeric"
                                   type="number"
-                                  onChange={(event) => setExpiryMinutes(event.target.value)}
+                                  onChange={(event) => setExpirySeconds(event.target.value)}
                                 />
-                                <p className="hint-text">1 minute to 3 hours.</p>
+                                <p className="hint-text">1 minute to {MAX_EXPIRY_SECONDS / 3600} hours.</p>
                               </div>
                             )}
                           </div>
 
-                          <button className="button" type="button" disabled={!selectedFile} onClick={() => setStep("recipients")}>
+                          <button className="button" type="button" disabled={!(selectedFiles.length > 0 || clipboardText.trim())} onClick={() => setStep("recipients")}>
                             Continue
                             <Users size={18} />
                           </button>
@@ -877,7 +1220,7 @@ export default function SecureShareApp() {
 
                           <button className="button teal" type="button" disabled={busy || !selectedRecipients.length} onClick={sendFile}>
                             <Send size={18} />
-                            Send Encrypted File
+                            Send Encrypted
                           </button>
                         </>
                       ) : null}
@@ -889,7 +1232,7 @@ export default function SecureShareApp() {
                             <h2>Sent</h2>
                             <p className="muted">Recipients can open it from their inbox while the policy allows.</p>
                             <button className="button" type="button" onClick={resetSend}>
-                              Send Another File
+                              Send Another
                             </button>
                           </div>
                         </div>
@@ -900,7 +1243,7 @@ export default function SecureShareApp() {
                       <div className="section-heading">
                         <div>
                           <h2>Inbox</h2>
-                          <p>Files shared with your active browser key.</p>
+                          <p>Content shared with your active browser key.</p>
                         </div>
                         <button className="icon-button" type="button" onClick={() => refreshInbox().catch(() => undefined)} aria-label="Refresh inbox">
                           <Inbox size={18} />
@@ -911,27 +1254,38 @@ export default function SecureShareApp() {
                           inbox.map((clip) => (
                             <motion.div className="inbox-item" key={clip.id} layout>
                               <span className="file-icon">
-                                <FileText size={20} />
+                                {clip.contentType === "clipboard" ? <Clipboard size={20} /> : <FileText size={20} />}
                               </span>
                               <div className="inbox-copy">
-                                <strong>{clip.filename}</strong>
+                                <strong>
+                                  {clip.contentType === "clipboard"
+                                    ? "Clipboard"
+                                    : clip.files.length > 1
+                                      ? `${clip.files.length} files`
+                                      : clip.filename}
+                                  {clip.hasClipboard && clip.contentType !== "clipboard" ? " + clipboard" : ""}
+                                </strong>
                                 <span>
-                                  From {clip.senderName} | {formatBytes(clip.sizeBytes)} |{" "}
+                                  From <strong>{clip.senderName}</strong>
+                                  {!clip.senderVerified && <em className="unknown-warning"> (unknown)</em>}
+                                  {" | "}{formatBytes(clip.sizeBytes)}{" | "}
                                   {clip.expiryMode === "time"
                                     ? `expires in ${formatTimeLeft(clip.expiresAt)}`
                                     : `${clip.viewsLeft} download${clip.viewsLeft === 1 ? "" : "s"} left`}
+                                  {" | "}
+                                  delete after {clip.deletionTrigger}
                                 </span>
                               </div>
                               <div className="inbox-actions">
                                 <button className="button" type="button" disabled={busy} onClick={() => openClip(clip)}>
-                                  <Download size={18} />
+                                  {clip.contentType === "clipboard" ? <Copy size={18} /> : <Download size={18} />}
                                   Open
                                 </button>
                               </div>
                             </motion.div>
                           ))
                         ) : (
-                          <div className="empty-state">No files yet.</div>
+                          <div className="empty-state">No content yet.</div>
                         )}
                       </div>
                     </motion.div>
@@ -960,9 +1314,9 @@ export default function SecureShareApp() {
               exit={{ opacity: 0, y: 14, scale: 0.98 }}
             >
               <AlertCircle size={34} />
-              <h2 id="file-alert-title">File Too Large</h2>
+              <h2 id="file-alert-title">Size Limit Exceeded</h2>
               <p>
-                {alertFile.name} is {formatBytes(alertFile.size)}. The maximum size is {formatBytes(MAX_FILE_SIZE_BYTES)}.
+                {alertFile.name} would exceed the {formatBytes(MAX_FILE_SIZE_BYTES)} total size limit.
               </p>
               <button className="button" type="button" onClick={() => setAlertFile(null)}>
                 Got It

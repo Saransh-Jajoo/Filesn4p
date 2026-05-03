@@ -1,113 +1,113 @@
 # FileSn4p Workflow
 
-This document explains the current Next.js/Vercel workflow for secure multi-recipient file sharing.
+This document defines the production behavior for share creation, delivery, lifecycle controls, and cleanup.
 
-## 1. User Enters The Lobby
+## 1. Join Lobby
 
-1. The browser generates an ECDH P-256 key pair with Web Crypto.
-2. The browser sends only the public key, username, and fingerprint to `POST /api/rooms`.
-3. The API stores the temporary active user in Redis with a short TTL.
-4. The private key stays in the browser tab.
+1. Client generates ECDH key pair locally.
+2. Client sends `username`, `publicKey`, `fingerprint` to `POST /api/rooms`.
+3. Backend creates temporary user session in Redis/in-memory store.
+4. Private key never leaves browser runtime.
 
-## 2. Active Users Stay Fresh
+## 2. Keep Session Alive
 
-1. The browser calls `POST /api/rooms/[roomId]/heartbeat` every 15 seconds.
-2. The app does not display a public online roster.
-3. Users that stop heartbeating disappear from recipient search results.
+1. Client sends heartbeat every 15 seconds to `POST /api/rooms/[roomId]/heartbeat`.
+2. Stale users are invalidated after timeout.
+3. Lobby does not expose public online counts.
 
-## 3. Sender Selects File And Policy
+## 3. Compose Share
 
-1. The UI accepts one file up to 50 MB.
-2. Files above 50 MB show an in-app alert before upload.
-3. The sender enters:
-   - Download limit: minimum 1, no product cap.
-   - Or expiry time: 1 to 180 minutes.
-4. Both values are validated again in `POST /api/rooms/[roomId]/clips`.
-5. Only one policy is active. Download mode ignores the time input; time mode ignores the download-count input.
+Sender can choose:
 
-## 4. Sender Selects Recipients
+- content: `file`, `clipboard`, or `both`
+- deletion trigger: `download`, `open`, `copy`, `time`
+- expiry mode: `downloads` or `time` (validated with trigger compatibility)
 
-1. Recipient search calls `GET /api/rooms/[roomId]/users/search`.
-2. Results show username and key fingerprint.
-3. The sender can select multiple active users, including 10+ recipients.
-4. Recipient selection is sent as structured JSON, not string-concatenated data.
-5. `GET /api/rooms/[roomId]/users` returns only the current user so a client cannot enumerate everyone in the lobby through the normal API.
+Limits:
 
-## 5. Browser Encrypts The Share
+- Total content per share/session: 50 MB (files + clipboard plaintext bytes)
+- Download limit max: 5
+- Time expiry max from client: 4 hours
+- Backend hard cap: 24 hours
 
-1. The browser creates one random AES-256-GCM file key.
-2. The file is encrypted once with that key.
+## 4. Encryption
+
+1. Files are encrypted once with AES-256-GCM.
+2. Clipboard text (if present) is encrypted under same share key with separate nonce.
 3. For each recipient:
-   - Import recipient ECDH public key.
-   - Create an ephemeral ECDH key pair.
-   - Derive a wrapping key with HKDF-SHA256.
-   - Wrap the AES file key with AES-GCM.
-   - Build per-recipient metadata.
-4. Plaintext never leaves the browser.
+   - derive wrap key via ECDH + HKDF
+   - wrap AES key
+   - store recipient-specific metadata
 
-## 6. Browser Uploads Ciphertext Directly To Blob
+## 5. Upload
 
-1. The browser calls the Vercel Blob client upload helper.
-2. `/api/upload` validates the active user before issuing an upload token.
-3. The encrypted Blob uploads directly from the browser to private Vercel Blob.
-4. This avoids Vercel Function request body limits for 50 MB files.
-5. If `BLOB_READ_WRITE_TOKEN` is missing, `/api/upload` returns a clear configuration error and `/api/health` reports `blobConfigured:false`.
+1. For file-containing shares, client uploads encrypted payload directly to Vercel Blob using `/api/upload`.
+2. Upload token route validates active room/user and max size.
+3. Clipboard-only shares skip Blob upload and store only encrypted clipboard payload.
 
-## 7. API Registers The Share
+## 6. Register Share
 
-1. The browser sends Blob URL/pathname, file sizes, policy, and per-recipient metadata to `POST /api/rooms/[roomId]/clips`.
-2. The API verifies sender and recipients are active.
-3. The API creates one share record and one clip record per recipient.
-4. Redis stores:
-   - Share metadata
-   - Per-recipient clip metadata
-   - Recipient inbox IDs
-   - Atomic download counter
+`POST /api/rooms/[roomId]/clips` stores:
 
-## 8. Recipient Opens A File
+- one share record
+- one recipient clip record per recipient
+- lifecycle policy and expiry timestamps
+- reference indexes for cleanup (`users`, `shares`, `clips`)
 
-1. Recipient inbox calls `GET /api/rooms/[roomId]/clips`.
-2. Clicking Open calls `GET /api/clips/[clipId]/download?userId=...`.
-3. The API verifies:
-   - Clip exists
-   - User is the intended recipient
-   - Recipient is active
-   - Share is not expired
-   - Downloads remain
-4. The API decrements the Redis counter before streaming encrypted bytes.
-5. Metadata is returned in the `X-Clip-Metadata` header.
-6. The browser unwraps the AES key and decrypts locally.
+Policy normalization:
 
-## 9. Self-Destruction
+- `download` -> uses user-supplied download limit (1..5)
+- `open` / `copy` -> forced single access
+- `time` -> access count ignored; expiry-only lifecycle
 
-1. Time expiry blocks access after 1 to 180 minutes when time mode is selected.
-2. Download expiry blocks access once the counter reaches zero when download mode is selected.
-3. On the final download, the API schedules Blob and metadata cleanup.
-4. Expired shares are also cleaned opportunistically when touched by inbox or download routes.
+## 7. Inbox Listing
 
-## 10. Theme Workflow
+`GET /api/rooms/[roomId]/clips` returns active clips for recipient only.
 
-1. CSS variables define all app colors.
-2. If no stored preference exists, system preference controls the initial theme.
-3. The theme toggle writes `filesn4p-theme` to local storage.
-4. The UI switches between `public/logo-light.svg` and `public/logo-dark.svg`.
-5. Inputs, selected states, hover states, focus rings, and select elements all use theme variables to avoid the white-text-on-white-background issue.
+Each item includes:
 
-## 11. Deployment Workflow
+- sender name and sender fingerprint
+- sender verification status (unknown sender warning if no longer verifiable)
+- content type, file info, clipboard flag
+- lifecycle metadata (`expiryMode`, `deletionTrigger`, `viewsLeft`)
 
-1. Install dependencies with `npm install`.
-2. Create a private Vercel Blob store.
-3. Set `BLOB_READ_WRITE_TOKEN`.
-4. Add Upstash Redis and set:
-   - `UPSTASH_REDIS_REST_URL`
-   - `UPSTASH_REDIS_REST_TOKEN`
-5. Run:
+## 8. Open/Download
 
-```bash
-npm run typecheck
-npm run build
-npm audit --audit-level=moderate
-```
+`GET /api/clips/[clipId]/download?userId=...`:
 
-6. Deploy to Vercel using the Next.js framework preset.
-7. Confirm `/api/health` returns `{"status":"ok","durableStore":true,"blobConfigured":true}`.
+1. Validates recipient ownership and active session.
+2. Enforces expiry and lifecycle policy.
+3. For `download/open/copy` triggers, decrements server-side counter atomically.
+4. For `time` trigger, skips counter decrement.
+5. Returns encrypted payload and metadata headers, or clipboard payload JSON for clipboard-only shares.
+6. On final allowed access, schedules cleanup.
+
+## 9. Logout Lifecycle
+
+`POST /api/rooms/[roomId]/logout`:
+
+- invalidates current user session
+- optional `purgeData=true` removes:
+  - sender’s owned shares
+  - recipient inbox clips
+  - share/clip index references
+
+## 10. Cleanup Lifecycle
+
+`GET /api/cleanup`:
+
+- in production, requires `CLEANUP_SECRET` and header: `x-cleanup-secret`
+- removes stale users
+- removes expired/exhausted/orphaned shares
+- removes orphaned clip records
+- deletes referenced Blob objects
+- prunes index pointers for missing records
+
+Recommended cron schedule: every 5-15 minutes.
+
+## 11. Privacy Model
+
+- No system-wide activity counters in UI
+- No public roster endpoint for all active users
+- Search-based recipient discovery only
+- Sender identity shown in inbox with unknown warning fallback

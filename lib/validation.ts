@@ -1,14 +1,16 @@
 import {
   CLIP_TYPE,
   CURVE,
+  MAX_CLIPBOARD_TEXT_BYTES,
+  MAX_DOWNLOAD_LIMIT,
   MAX_EXPIRY_SECONDS,
   MAX_FILE_SIZE_BYTES,
   MAX_RECIPIENTS,
-  MAX_SAFE_DOWNLOAD_LIMIT,
   MIN_DOWNLOAD_LIMIT,
   MIN_EXPIRY_SECONDS,
   PUBLIC_KEY_TYPE
 } from "@/lib/constants";
+import type { ContentType, DeletionTrigger, ExpiryMode } from "@/lib/constants";
 import type { PublicKeyDoc, RecipientMetadata } from "@/lib/types";
 
 const USERNAME_RE = /^[A-Za-z0-9_. -]{1,32}$/;
@@ -88,8 +90,8 @@ export function validateDownloadLimit(value: unknown) {
   const raw = String(value ?? "").trim();
   if (!/^[1-9]\d*$/.test(raw)) throw new ApiError("Download limit must be a positive integer.");
   const parsed = Number(raw);
-  if (!Number.isSafeInteger(parsed) || parsed < MIN_DOWNLOAD_LIMIT || parsed > MAX_SAFE_DOWNLOAD_LIMIT) {
-    throw new ApiError("Download limit is outside the supported integer range.");
+  if (!Number.isSafeInteger(parsed) || parsed < MIN_DOWNLOAD_LIMIT || parsed > MAX_DOWNLOAD_LIMIT) {
+    throw new ApiError(`Download limit must be between ${MIN_DOWNLOAD_LIMIT} and ${MAX_DOWNLOAD_LIMIT}.`);
   }
   return parsed;
 }
@@ -98,7 +100,7 @@ export function validateExpirySeconds(value: unknown) {
   const parsed = Number(value);
   if (!Number.isInteger(parsed)) throw new ApiError("Expiry must be a whole number of seconds.");
   if (parsed < MIN_EXPIRY_SECONDS || parsed > MAX_EXPIRY_SECONDS) {
-    throw new ApiError("Expiry must be between 1 minute and 3 hours.");
+    throw new ApiError(`Expiry must be between 1 minute and ${MAX_EXPIRY_SECONDS / 3600} hours.`);
   }
   return parsed;
 }
@@ -109,6 +111,16 @@ export function validateFileSize(size: unknown) {
     throw new ApiError("File must be between 1 byte and 50 MB.");
   }
   return parsed;
+}
+
+export function validateTotalSize(totalBytes: number) {
+  if (!Number.isInteger(totalBytes) || totalBytes < 1) {
+    throw new ApiError("Total content size must be at least 1 byte.");
+  }
+  if (totalBytes > MAX_FILE_SIZE_BYTES) {
+    throw new ApiError(`Total content size must not exceed ${MAX_FILE_SIZE_BYTES / (1024 * 1024)} MB.`);
+  }
+  return totalBytes;
 }
 
 export function validateRecipients(value: unknown) {
@@ -154,4 +166,64 @@ export function validateBlobPathname(value: unknown, roomId: string) {
     throw new ApiError("Blob pathname is invalid.");
   }
   return pathname;
+}
+
+export function validateContentType(value: unknown): ContentType {
+  const ct = String(value || "file");
+  if (ct !== "file" && ct !== "clipboard" && ct !== "both") {
+    throw new ApiError("Content type must be 'file', 'clipboard', or 'both'.");
+  }
+  return ct;
+}
+
+export function validateClipboardText(value: unknown): string {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new ApiError("Clipboard text cannot be empty.");
+  }
+  if (new TextEncoder().encode(value).length > MAX_CLIPBOARD_TEXT_BYTES) {
+    throw new ApiError(`Clipboard text must not exceed ${MAX_CLIPBOARD_TEXT_BYTES / 1024} KB.`);
+  }
+  return value;
+}
+
+export function validateClipboardCiphertext(value: unknown): string {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new ApiError("Encrypted clipboard payload is missing.");
+  }
+  const normalized = value.trim();
+  if (normalized.length > MAX_CLIPBOARD_TEXT_BYTES * 4) {
+    throw new ApiError("Encrypted clipboard payload is too large.");
+  }
+  if (!/^[A-Za-z0-9+/=_-]+$/.test(normalized)) {
+    throw new ApiError("Encrypted clipboard payload is invalid.");
+  }
+  return normalized;
+}
+
+export function validateDeletionTrigger(value: unknown): DeletionTrigger {
+  const trigger = String(value || "download");
+  if (trigger !== "download" && trigger !== "open" && trigger !== "copy" && trigger !== "time") {
+    throw new ApiError("Deletion trigger must be 'download', 'open', 'copy', or 'time'.");
+  }
+  return trigger;
+}
+
+export function validateExpiryMode(value: unknown): ExpiryMode {
+  const mode = String(value || "downloads");
+  if (mode !== "downloads" && mode !== "time") {
+    throw new ApiError("Expiry mode must be 'downloads' or 'time'.");
+  }
+  return mode;
+}
+
+export function validateFiles(value: unknown): Array<{ name: string; sizeBytes: number }> {
+  if (!Array.isArray(value)) return [];
+  return value.map((f) => {
+    if (!f || typeof f !== "object") throw new ApiError("Invalid file info.");
+    const item = f as Record<string, unknown>;
+    return {
+      name: safeFilename(item.name),
+      sizeBytes: validateFileSize(item.sizeBytes)
+    };
+  });
 }

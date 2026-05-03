@@ -1,3 +1,5 @@
+import type { ContentType, DeletionTrigger, ExpiryMode } from "@/lib/constants";
+
 export type PublicKeyDoc = {
   type: string;
   version: number;
@@ -15,6 +17,8 @@ export type RecipientMetadata = {
   algorithm: string;
   curve: "P-256";
   filename: string;
+  files?: Array<{ name: string; sizeBytes: number }>;
+  hasClipboard?: boolean;
   sender: {
     username: string;
     fingerprint: string;
@@ -42,6 +46,10 @@ export type RecipientMetadata = {
     name: "AES-GCM";
     nonce: string;
   };
+  clipboardCipher?: {
+    name: "AES-GCM";
+    nonce: string;
+  };
 };
 
 export type UserRecord = {
@@ -54,14 +62,23 @@ export type UserRecord = {
   lastSeen: number;
 };
 
+export type FileInfo = {
+  name: string;
+  sizeBytes: number;
+};
+
 export type ShareRecord = {
   id: string;
   roomId: string;
   senderId: string;
   senderName: string;
+  senderFingerprint: string;
   recipientIds: string[];
   clipIds: string[];
+  contentType: ContentType;
   originalName: string;
+  files: FileInfo[];
+  clipboardTextEncrypted?: string; // base64-encoded encrypted clipboard text
   sizeBytes: number;
   encryptedSizeBytes: number;
   blobUrl: string;
@@ -69,7 +86,8 @@ export type ShareRecord = {
   blobPathname: string;
   createdAt: number;
   expiresAt: number;
-  expiryMode: "downloads" | "time";
+  expiryMode: ExpiryMode;
+  deletionTrigger: DeletionTrigger;
   downloadLimit: number;
 };
 
@@ -79,22 +97,33 @@ export type ClipRecord = {
   roomId: string;
   senderId: string;
   senderName: string;
+  senderFingerprint: string;
   recipientId: string;
+  contentType: ContentType;
   originalName: string;
+  files: FileInfo[];
+  hasClipboard: boolean;
   sizeBytes: number;
   metadata: RecipientMetadata;
   createdAt: number;
   expiresAt: number;
-  expiryMode?: "downloads" | "time";
+  expiryMode?: ExpiryMode;
+  deletionTrigger?: DeletionTrigger;
 };
 
 export type InboxClip = {
   id: string;
   senderName: string;
+  senderFingerprint: string;
+  senderVerified: boolean;
+  contentType: ContentType;
   filename: string;
+  files: FileInfo[];
+  hasClipboard: boolean;
   sizeBytes: number;
   createdAt: number;
   expiresAt: number;
-  expiryMode: "downloads" | "time";
+  expiryMode: ExpiryMode;
+  deletionTrigger: DeletionTrigger;
   viewsLeft: number;
 };

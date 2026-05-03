@@ -2,12 +2,14 @@ import { del as deleteBlob } from "@vercel/blob";
 import { Redis } from "@upstash/redis";
 import {
   ACTIVE_USER_SECONDS,
+  BACKEND_MAX_TTL_SECONDS,
   MAX_ROOM_USERS,
   PUBLIC_LOBBY_ID,
   SHARE_CLEANUP_GRACE_SECONDS,
   STALE_USER_SECONDS
 } from "@/lib/constants";
-import type { ClipRecord, InboxClip, PublicKeyDoc, RecipientMetadata, ShareRecord, UserRecord } from "@/lib/types";
+import type { ContentType, DeletionTrigger, ExpiryMode } from "@/lib/constants";
+import type { ClipRecord, FileInfo, InboxClip, PublicKeyDoc, RecipientMetadata, ShareRecord, UserRecord } from "@/lib/types";
 import { ApiError, nowSeconds } from "@/lib/validation";
 
 type StoredValue<T> = {
@@ -61,6 +63,22 @@ function shareKey(shareId: string) {
 
 function shareViewsKey(shareId: string) {
   return `share:${shareId}:views`;
+}
+
+function userSharesKey(userId: string) {
+  return `user:${userId}:shares`;
+}
+
+function usersIndexKey() {
+  return "index:users";
+}
+
+function sharesIndexKey() {
+  return "index:shares";
+}
+
+function clipsIndexKey() {
+  return "index:clips";
 }
 
 function rateKey(bucket: string, identity: string, windowSeconds: number) {
@@ -195,6 +213,16 @@ async function hydrateUsers(roomId: string) {
   return users.filter((user): user is UserRecord => !!user);
 }
 
+function effectiveDownloadLimit(trigger: DeletionTrigger, requestedLimit: number) {
+  if (trigger === "time") return 0;
+  if (trigger === "open" || trigger === "copy") return 1;
+  return requestedLimit;
+}
+
+async function removeClipReferences(share: ShareRecord) {
+  await Promise.all(share.recipientIds.map((recipientId) => setRemove(inboxKey(recipientId), ...share.clipIds)));
+}
+
 export async function enforceRateLimit(request: Request, bucket: string, limit: number, windowSeconds: number) {
   const forwarded = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
   const identity = forwarded || request.headers.get("x-real-ip") || "local";
@@ -230,6 +258,7 @@ export async function createUser(input: {
 
   await kvSet(userKey(user.id), user, STALE_USER_SECONDS);
   await setAdd(roomUsersKey(PUBLIC_LOBBY_ID), user.id);
+  await setAdd(usersIndexKey(), user.id);
   await setExpire(roomUsersKey(PUBLIC_LOBBY_ID), STALE_USER_SECONDS * 2);
 
   return user;
@@ -242,6 +271,7 @@ export async function touchUser(roomId: string, userId: string) {
   user.lastSeen = nowSeconds();
   await kvSet(userKey(userId), user, STALE_USER_SECONDS);
   await setAdd(roomUsersKey(roomId), userId);
+  await setAdd(usersIndexKey(), userId);
   await setExpire(roomUsersKey(roomId), STALE_USER_SECONDS * 2);
   return user;
 }
@@ -275,14 +305,18 @@ export async function createShare(input: {
   roomId: string;
   senderId: string;
   recipients: Array<{ id: string; metadata: RecipientMetadata }>;
+  contentType: ContentType;
   originalName: string;
+  files: FileInfo[];
+  clipboardTextEncrypted?: string;
   sizeBytes: number;
   encryptedSizeBytes: number;
   blobUrl: string;
   blobDownloadUrl?: string;
   blobPathname: string;
   expiresInSeconds: number;
-  expiryMode: "downloads" | "time";
+  expiryMode: ExpiryMode;
+  deletionTrigger: DeletionTrigger;
   downloadLimit: number;
 }) {
   const timestamp = nowSeconds();
@@ -298,19 +332,25 @@ export async function createShare(input: {
     throw new ApiError("Choose a recipient other than yourself.");
   }
 
+  const effectiveExpirySeconds = Math.min(Math.max(60, input.expiresInSeconds), BACKEND_MAX_TTL_SECONDS);
   const shareId = randomId();
-  const expiresAt = timestamp + input.expiresInSeconds;
+  const expiresAt = timestamp + effectiveExpirySeconds;
   const ttl = secondsUntil(expiresAt) + SHARE_CLEANUP_GRACE_SECONDS;
   const clipIds = recipientIds.map(() => randomId());
+  const resolvedDownloadLimit = effectiveDownloadLimit(input.deletionTrigger, input.downloadLimit);
 
   const share: ShareRecord = {
     id: shareId,
     roomId: input.roomId,
     senderId: sender.id,
     senderName: sender.username,
+    senderFingerprint: sender.fingerprint,
     recipientIds,
     clipIds,
+    contentType: input.contentType,
     originalName: input.originalName,
+    files: input.files,
+    clipboardTextEncrypted: input.clipboardTextEncrypted,
     sizeBytes: input.sizeBytes,
     encryptedSizeBytes: input.encryptedSizeBytes,
     blobUrl: input.blobUrl,
@@ -319,11 +359,18 @@ export async function createShare(input: {
     createdAt: timestamp,
     expiresAt,
     expiryMode: input.expiryMode,
-    downloadLimit: input.downloadLimit
+    deletionTrigger: input.deletionTrigger,
+    downloadLimit: resolvedDownloadLimit
   };
 
   await kvSet(shareKey(shareId), share, ttl);
-  await kvSet(shareViewsKey(shareId), input.downloadLimit, ttl);
+  if (resolvedDownloadLimit > 0) {
+    await kvSet(shareViewsKey(shareId), resolvedDownloadLimit, ttl);
+  }
+  await setAdd(sharesIndexKey(), shareId);
+
+  await setAdd(userSharesKey(sender.id), shareId);
+  await setExpire(userSharesKey(sender.id), ttl);
 
   await Promise.all(
     input.recipients.map(async (recipient, index) => {
@@ -333,14 +380,21 @@ export async function createShare(input: {
         roomId: input.roomId,
         senderId: sender.id,
         senderName: sender.username,
+        senderFingerprint: sender.fingerprint,
         recipientId: recipient.id,
+        contentType: input.contentType,
         originalName: input.originalName,
+        files: input.files,
+        hasClipboard: !!input.clipboardTextEncrypted,
         sizeBytes: input.sizeBytes,
         metadata: recipient.metadata,
         createdAt: timestamp,
-        expiresAt
+        expiresAt,
+        expiryMode: input.expiryMode,
+        deletionTrigger: input.deletionTrigger
       };
       await kvSet(clipKey(clip.id), clip, ttl);
+      await setAdd(clipsIndexKey(), clip.id);
       await setAdd(inboxKey(recipient.id), clip.id);
       await setExpire(inboxKey(recipient.id), ttl);
     })
@@ -366,16 +420,30 @@ export async function listInbox(roomId: string, userId: string): Promise<InboxCl
         await cleanupShare(share);
         return null;
       }
-      const viewsLeft = await getViewsLeft(share.id);
-      if (viewsLeft <= 0) return null;
+
+      const viewsLeft = share.deletionTrigger === "time" ? 0 : await getViewsLeft(share.id);
+      if (share.deletionTrigger !== "time" && viewsLeft <= 0) {
+        await cleanupShare(share);
+        return null;
+      }
+
+      const senderUser = await kvGet<UserRecord>(userKey(clip.senderId));
+      const senderVerified = !!senderUser && senderUser.username === clip.senderName;
+
       return {
         id: clip.id,
         senderName: clip.senderName,
+        senderFingerprint: clip.senderFingerprint || "unknown",
+        senderVerified,
+        contentType: clip.contentType || "file",
         filename: clip.originalName,
+        files: clip.files || [],
+        hasClipboard: clip.hasClipboard || false,
         sizeBytes: clip.sizeBytes,
         createdAt: clip.createdAt,
         expiresAt: clip.expiresAt,
         expiryMode: share.expiryMode,
+        deletionTrigger: share.deletionTrigger || "download",
         viewsLeft
       };
     })
@@ -397,18 +465,120 @@ export async function claimDownload(clipId: string, userId: string) {
     throw new ApiError("This file is no longer available.", 404);
   }
 
+  if (share.deletionTrigger === "time") {
+    return { clip, share, remaining: null as number | null };
+  }
+
   const remaining = await decrementIfPositive(shareViewsKey(share.id));
-  if (remaining < 0) throw new ApiError("This file is no longer available.", 404);
+  if (remaining < 0) {
+    await cleanupShare(share);
+    throw new ApiError("This file is no longer available.", 404);
+  }
 
   return { clip, share, remaining };
 }
 
-export async function cleanupShare(share: ShareRecord) {
+export async function cleanupShare(share: ShareRecord | null | undefined) {
+  if (!share) return;
+
+  const blobRef = share.blobPathname || share.blobUrl;
   await Promise.allSettled([
-    deleteBlob(share.blobUrl).catch(() => undefined),
+    blobRef ? deleteBlob(blobRef).catch(() => undefined) : undefined,
     kvDel(shareKey(share.id), shareViewsKey(share.id), ...share.clipIds.map(clipKey)),
-    ...share.recipientIds.map((recipientId) => setRemove(inboxKey(recipientId), ...share.clipIds))
+    setRemove(sharesIndexKey(), share.id),
+    setRemove(clipsIndexKey(), ...share.clipIds),
+    setRemove(userSharesKey(share.senderId), share.id),
+    removeClipReferences(share)
   ]);
+}
+
+export async function logoutUser(roomId: string, userId: string, purgeData: boolean) {
+  const user = await kvGet<UserRecord>(userKey(userId));
+  if (user && user.roomId !== roomId) return;
+
+  await setRemove(roomUsersKey(roomId), userId);
+  await setRemove(usersIndexKey(), userId);
+  await kvDel(userKey(userId));
+
+  if (!purgeData) return;
+
+  const shareIds = await setMembers(userSharesKey(userId));
+  const shares = await Promise.all(shareIds.map((id) => kvGet<ShareRecord>(shareKey(id))));
+  await Promise.allSettled(shares.map((share) => cleanupShare(share)));
+
+  const inboxIds = await setMembers(inboxKey(userId));
+  if (inboxIds.length) {
+    await kvDel(...inboxIds.map(clipKey));
+    await setRemove(clipsIndexKey(), ...inboxIds);
+  }
+  await kvDel(inboxKey(userId), userSharesKey(userId));
+}
+
+export async function periodicCleanup(): Promise<{ expired: number; staleUsers: number }> {
+  const now = nowSeconds();
+  let expiredCount = 0;
+  let staleUserCount = 0;
+
+  const userIds = await setMembers(usersIndexKey());
+  const users = await Promise.all(userIds.map((id) => kvGet<UserRecord>(userKey(id))));
+
+  for (let i = 0; i < users.length; i++) {
+    const user = users[i];
+    const userId = userIds[i];
+    if (!user) {
+      await setRemove(usersIndexKey(), userId);
+      await setRemove(roomUsersKey(PUBLIC_LOBBY_ID), userId);
+      await kvDel(inboxKey(userId), userSharesKey(userId));
+      staleUserCount++;
+      continue;
+    }
+
+    if (user.lastSeen < now - STALE_USER_SECONDS) {
+      await logoutUser(user.roomId, user.id, true);
+      staleUserCount++;
+    }
+  }
+
+  const shareIds = await setMembers(sharesIndexKey());
+  const shares = await Promise.all(shareIds.map((id) => kvGet<ShareRecord>(shareKey(id))));
+
+  for (let i = 0; i < shares.length; i++) {
+    const share = shares[i];
+    const shareId = shareIds[i];
+    if (!share) {
+      await setRemove(sharesIndexKey(), shareId);
+      continue;
+    }
+
+    const sender = await kvGet<UserRecord>(userKey(share.senderId));
+    const senderMissing = !sender;
+    const expired = share.expiresAt <= now;
+    const exhausted = share.deletionTrigger !== "time" && (await getViewsLeft(share.id)) <= 0;
+
+    if (senderMissing || expired || exhausted) {
+      await cleanupShare(share);
+      expiredCount++;
+    }
+  }
+
+  const clipIds = await setMembers(clipsIndexKey());
+  const clips = await Promise.all(clipIds.map((id) => kvGet<ClipRecord>(clipKey(id))));
+  for (let i = 0; i < clips.length; i++) {
+    const clip = clips[i];
+    const clipId = clipIds[i];
+    if (!clip) {
+      await setRemove(clipsIndexKey(), clipId);
+      continue;
+    }
+    const share = await kvGet<ShareRecord>(shareKey(clip.shareId));
+    if (!share) {
+      await kvDel(clipKey(clip.id));
+      await setRemove(inboxKey(clip.recipientId), clip.id);
+      await setRemove(clipsIndexKey(), clip.id);
+    }
+  }
+
+  return { expired: expiredCount, staleUsers: staleUserCount };
 }
 
 export function isDurableStoreConfigured() {
