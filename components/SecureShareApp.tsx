@@ -378,6 +378,7 @@ export default function SecureShareApp() {
   const [inbox, setInbox] = useState<InboxClip[]>([]);
   const [busy, setBusy] = useState(false);
   const [alertFile, setAlertFile] = useState<{ name: string; size: number } | null>(null);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const logo = theme === "light" ? "/logo-light.svg" : "/logo-dark.svg";
@@ -602,21 +603,54 @@ export default function SecureShareApp() {
       let blobPathname = "";
 
       if (hasFiles) {
-        setStatus({ text: "Uploading encrypted payload..." });
+        if (!session.blobConfigured) {
+          throw new Error("File uploads are not configured. Add BLOB_READ_WRITE_TOKEN to your Vercel environment and redeploy.");
+        }
+        
+        setStatus({ text: `Uploading encrypted payload (${formatBytes(encrypted.encryptedBlob.size)})...` });
         const pathname = `clips/${session.roomId}/${crypto.randomUUID()}-${sanitizeName(selectedFiles[0].name)}.bin`;
         const uploadController = new AbortController();
-        const uploadTimeout = window.setTimeout(() => uploadController.abort(), 120_000);
+        
+        // Set timeout to 60 seconds for upload
+        const uploadTimeoutId = window.setTimeout(() => {
+          uploadController.abort();
+        }, 60_000);
+        
         let blob;
         try {
-          blob = await upload(pathname, encrypted.encryptedBlob, {
+          const uploadPromise = upload(pathname, encrypted.encryptedBlob, {
             access: "private",
             handleUploadUrl: "/api/upload",
             clientPayload: JSON.stringify({ roomId: session.roomId, userId: session.userId }),
             abortSignal: uploadController.signal
           });
+          
+          // Add a secondary timeout that provides better error messaging
+          const timeoutPromise = new Promise<never>((_, reject) => {
+            const timeoutId = window.setTimeout(() => {
+              uploadController.abort();
+              reject(new Error("Upload timeout. The file upload took too long. Check your internet connection and try again."));
+            }, 65_000);
+            return () => window.clearTimeout(timeoutId);
+          });
+          
+          blob = await Promise.race([uploadPromise, timeoutPromise]);
+        } catch (uploadError) {
+          // Better error messages for different failure scenarios
+          if (uploadError instanceof Error) {
+            if (uploadError.message.includes("abort") || uploadError.message.includes("timeout")) {
+              throw new Error("Upload timed out. The file upload was cancelled due to timeout or slow connection. Please check your internet and try again.");
+            }
+            if (uploadError.message.includes("not configured") || uploadError.message.includes("BLOB_READ_WRITE_TOKEN")) {
+              throw new Error("Vercel Blob storage is not configured. Add BLOB_READ_WRITE_TOKEN to your .env.local and restart the dev server.");
+            }
+            throw uploadError;
+          }
+          throw new Error("File upload failed. Please check your connection and try again.");
         } finally {
-          window.clearTimeout(uploadTimeout);
+          window.clearTimeout(uploadTimeoutId);
         }
+        
         blobUrl = blob.url;
         blobDownloadUrl = "downloadUrl" in blob ? blob.downloadUrl : undefined;
         blobPathname = blob.pathname;
@@ -649,6 +683,11 @@ export default function SecureShareApp() {
         })
       });
 
+      // Show success message
+      const successText = hasFiles 
+        ? `✓ Encrypted ${selectedFiles.length} file${selectedFiles.length === 1 ? "" : "s"} uploaded successfully!`
+        : "✓ Encrypted clipboard shared successfully!";
+      setSuccessMessage(successText);
       setStatus({ text: "Encrypted content sent.", kind: "success" });
       setStep("sent");
       await refreshInbox();
@@ -1320,6 +1359,29 @@ export default function SecureShareApp() {
               </p>
               <button className="button" type="button" onClick={() => setAlertFile(null)}>
                 Got It
+              </button>
+            </motion.div>
+          </motion.div>
+        ) : null}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {successMessage ? (
+          <motion.div className="alert-overlay" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+            <motion.div
+              className="alert-modal success-modal"
+              role="alertdialog"
+              aria-modal="true"
+              aria-labelledby="success-alert-title"
+              initial={{ opacity: 0, y: 14, scale: 0.98 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: 14, scale: 0.98 }}
+            >
+              <Check size={50} color="#34d399" />
+              <h2 id="success-alert-title" style={{ color: "#34d399" }}>Files Uploaded Successfully</h2>
+              <p>{successMessage}</p>
+              <button className="button" type="button" onClick={() => setSuccessMessage(null)}>
+                Continue
               </button>
             </motion.div>
           </motion.div>
