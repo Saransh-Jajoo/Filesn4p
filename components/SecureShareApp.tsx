@@ -379,6 +379,18 @@ export default function SecureShareApp() {
   const [busy, setBusy] = useState(false);
   const [alertFile, setAlertFile] = useState<{ name: string; size: number } | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [uploadedBlob, setUploadedBlob] = useState<{ url: string; downloadUrl?: string; pathname: string } | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const [preparedPayload, setPreparedPayload] = useState<
+    | {
+        encryptedBlob: Blob;
+        rawFileKeyBase64: string;
+        fileInfos: Array<{ name: string; sizeBytes: number }>;
+        fileNonceBase64: string;
+        clipboardTextEncrypted?: string;
+      }
+    | null
+  >(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const logo = theme === "light" ? "/logo-light.svg" : "/logo-dark.svg";
@@ -515,10 +527,131 @@ export default function SecureShareApp() {
       updated.push(file);
     }
     setSelectedFiles(updated);
+    // If running in a session with blob configured, prepare and upload immediately
+    if (session && session.blobConfigured) {
+      // Upload the current selected files as a single encrypted payload
+      uploadSelectedFiles(updated).catch((err) => setStatus({ text: errorMessage(err), kind: "error" }));
+    }
   };
 
   const removeFile = (index: number) => {
     setSelectedFiles((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  // Prepare encrypted payload (files + optional clipboard) without recipient wrapping,
+  // export the raw file key, then upload to Vercel Blob immediately.
+  const uploadSelectedFiles = async (files: File[]) => {
+    if (!session) return;
+    if (!files.length) return;
+    setIsUploading(true);
+    const startTime = Date.now();
+    
+    try {
+      setStatus({ text: "Preparing encrypted payload..." });
+
+      // Build manifest and plaintext as in encryptForShare
+      const fileInfos = files.map((f) => ({ name: sanitizeName(f.name), sizeBytes: f.size }));
+      const manifest = JSON.stringify({ version: 1, files: fileInfos });
+      const manifestBytes = encoder.encode(manifest);
+      const prefix = new Uint8Array(4);
+      new DataView(prefix.buffer).setUint32(0, manifestBytes.length, false);
+
+      const fileBuffers = await Promise.all(files.map((f) => f.arrayBuffer()));
+      const totalSize = prefix.length + manifestBytes.length + fileBuffers.reduce((sum, buf) => sum + buf.byteLength, 0);
+      const plaintext = new Uint8Array(totalSize);
+      let offset = 0;
+      plaintext.set(prefix, offset);
+      offset += prefix.length;
+      plaintext.set(manifestBytes, offset);
+      offset += manifestBytes.length;
+      for (const buf of fileBuffers) {
+        plaintext.set(new Uint8Array(buf), offset);
+        offset += buf.byteLength;
+      }
+
+      const fileKey = await subtleCrypto().generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+      const fileNonce = randomBytes(12);
+      const ciphertext = await subtleCrypto().encrypt({ name: "AES-GCM", iv: fileNonce }, fileKey, exactArrayBuffer(plaintext));
+      const encryptedBlobLocal = new Blob([ciphertext], { type: "application/octet-stream" });
+      const rawFileKey = await subtleCrypto().exportKey("raw", fileKey);
+      const rawKeyBase64 = toBase64(rawFileKey);
+      const fileNonceBase64 = toBase64(fileNonce);
+
+      setStatus({ text: `Uploading encrypted payload (${formatBytes(encryptedBlobLocal.size)})...` });
+
+      const pathname = `clips/${session.roomId}/${crypto.randomUUID()}-${sanitizeName(files[0].name)}.bin`;
+
+      const uploadController = new AbortController();
+      
+      // Use a longer timeout (90 seconds) and add elapsed time tracking
+      const uploadPromise = upload(pathname, encryptedBlobLocal, {
+        access: "private",
+        handleUploadUrl: "/api/upload",
+        clientPayload: JSON.stringify({ roomId: session.roomId, userId: session.userId }),
+        abortSignal: uploadController.signal
+      });
+
+      // Set up timeout with abort
+      const uploadTimeoutId = window.setTimeout(() => {
+        uploadController.abort();
+      }, 90_000);
+
+      let blobResp: any;
+      try {
+        blobResp = await uploadPromise;
+      } finally {
+        window.clearTimeout(uploadTimeoutId);
+      }
+
+      if (!blobResp) {
+        throw new Error("Upload failed: no response from server");
+      }
+
+      if (!blobResp.url) {
+        throw new Error("Upload failed: invalid response format from server");
+      }
+
+      const uploadDuration = Date.now() - startTime;
+      console.log(`✓ Uploaded ${formatBytes(encryptedBlobLocal.size)} in ${uploadDuration}ms`);
+
+      setUploadedBlob({
+        url: blobResp.url,
+        downloadUrl: blobResp.downloadUrl || undefined,
+        pathname: blobResp.pathname || pathname
+      });
+
+      setPreparedPayload({
+        encryptedBlob: encryptedBlobLocal,
+        rawFileKeyBase64: rawKeyBase64,
+        fileInfos,
+        fileNonceBase64,
+        clipboardTextEncrypted: undefined
+      });
+
+      setSuccessMessage(`✓ Encrypted ${files.length} file${files.length === 1 ? "" : "s"} uploaded successfully!`);
+      setStatus({ text: "Ready to send. Select recipients below.", kind: "success" });
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      console.error("Upload error:", errorMsg);
+      
+      let userMessage = "Upload failed. ";
+      if (errorMsg.includes("abort") || errorMsg.includes("timeout")) {
+        userMessage += "Request timed out. Check your internet connection and try again.";
+      } else if (errorMsg.includes("network")) {
+        userMessage += "Network error. Check your connection and try again.";
+      } else if (errorMsg.includes("BLOB_READ_WRITE_TOKEN")) {
+        userMessage += "Vercel Blob is not configured. Contact administrator.";
+      } else {
+        userMessage += errorMsg || "Unknown error occurred.";
+      }
+      
+      setStatus({ text: userMessage, kind: "error" });
+      setPreparedPayload(null);
+      setUploadedBlob(null);
+      setSuccessMessage(null);
+    } finally {
+      setIsUploading(false);
+    }
   };
 
   const searchRecipients = async () => {
@@ -596,7 +729,75 @@ export default function SecureShareApp() {
     try {
       setStatus({ text: `Encrypting for ${selectedRecipients.length} recipient${selectedRecipients.length === 1 ? "" : "s"}...` });
       const clipText = hasClipboard ? clipboardText.trim() : undefined;
-      const encrypted = await encryptForShare(selectedFiles, clipText, selectedRecipients, session, identity);
+
+      let encrypted: {
+        encryptedBlob: Blob;
+        recipients: Array<{ id: string; metadata: RecipientMetadata }>;
+        clipboardTextEncrypted?: string;
+        fileInfos: Array<{ name: string; sizeBytes: number }>;
+      };
+
+      // If we've already prepared and uploaded the encrypted payload on file selection,
+      // reuse that encrypted blob and just wrap the raw file key per recipient here.
+      if (preparedPayload && uploadedBlob && hasFiles) {
+        setStatus({ text: `Wrapping key for ${selectedRecipients.length} recipient${selectedRecipients.length === 1 ? "" : "s"}...` });
+        const rawKeyBytes = fromBase64(preparedPayload.rawFileKeyBase64);
+        // Recover the actual file cipher nonce that was used during encryption
+        const actualFileNonce = fromBase64(preparedPayload.fileNonceBase64);
+
+        // Encrypt clipboard text with the same file key if needed
+        let clipboardCipherNonce: Uint8Array | undefined;
+        let finalClipboardEncrypted: string | undefined;
+        if (clipText) {
+          const fileKeyRaw = rawKeyBytes;
+          const fileKey = await subtleCrypto().importKey("raw", exactArrayBuffer(fileKeyRaw), { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+          clipboardCipherNonce = randomBytes(12);
+          const clipPlaintext = encoder.encode(clipText);
+          const clipCiphertext = await subtleCrypto().encrypt({ name: "AES-GCM", iv: exactArrayBuffer(clipboardCipherNonce) }, fileKey, exactArrayBuffer(clipPlaintext));
+          finalClipboardEncrypted = toBase64(clipCiphertext);
+        }
+
+        const recipientMetadata = await Promise.all(
+          selectedRecipients.map(async (recipient) => {
+            const recipientPublicKey = await importPublicKey(recipient.publicKey);
+            const ephemeral = await subtleCrypto().generateKey({ name: "ECDH", namedCurve: CURVE }, true, ["deriveBits"]);
+            const wrapSalt = randomBytes(16);
+            const wrapNonce = randomBytes(12);
+            const wrapKey = await deriveWrapKey(ephemeral.privateKey, recipientPublicKey, wrapSalt, ["encrypt"]);
+            const wrappedKey = await subtleCrypto().encrypt({ name: "AES-GCM", iv: wrapNonce }, wrapKey, exactArrayBuffer(rawKeyBytes));
+            const ephemeralPublic = await subtleCrypto().exportKey("spki", ephemeral.publicKey);
+
+            const metadata: RecipientMetadata = {
+              type: CLIP_TYPE,
+              version: 1,
+              algorithm: "ECDH-HKDF-SHA256-AES-256-GCM",
+              curve: CURVE,
+              filename: preparedPayload.fileInfos.length === 1 ? preparedPayload.fileInfos[0].name : "shared-files.bin",
+              files: preparedPayload.fileInfos.length > 1 ? preparedPayload.fileInfos : undefined,
+              hasClipboard: !!clipText,
+              sender: { username: session.username, fingerprint: identity.fingerprint },
+              recipient: { username: recipient.username, fingerprint: recipient.fingerprint },
+              ephemeralPublicKey: { format: "spki", data: toBase64(ephemeralPublic) },
+              kdf: { name: "HKDF", hash: "SHA-256", salt: toBase64(wrapSalt), info: toBase64(WRAP_INFO) },
+              wrappedKey: { name: "AES-GCM", nonce: toBase64(wrapNonce), data: toBase64(wrappedKey) },
+              cipher: { name: "AES-GCM", nonce: toBase64(actualFileNonce) },
+              clipboardCipher: clipboardCipherNonce ? { name: "AES-GCM", nonce: toBase64(clipboardCipherNonce) } : undefined
+            };
+
+            return { id: recipient.id, metadata };
+          })
+        );
+
+        encrypted = {
+          encryptedBlob: preparedPayload.encryptedBlob,
+          recipients: recipientMetadata,
+          clipboardTextEncrypted: finalClipboardEncrypted,
+          fileInfos: preparedPayload.fileInfos
+        };
+      } else {
+        const result = await encryptForShare(selectedFiles, clipText, selectedRecipients, session, identity);
+        encrypted = result as any;
+      }
 
       let blobUrl = "";
       let blobDownloadUrl: string | undefined;
@@ -606,54 +807,53 @@ export default function SecureShareApp() {
         if (!session.blobConfigured) {
           throw new Error("File uploads are not configured. Add BLOB_READ_WRITE_TOKEN to your Vercel environment and redeploy.");
         }
-        
-        setStatus({ text: `Uploading encrypted payload (${formatBytes(encrypted.encryptedBlob.size)})...` });
-        const pathname = `clips/${session.roomId}/${crypto.randomUUID()}-${sanitizeName(selectedFiles[0].name)}.bin`;
-        const uploadController = new AbortController();
-        
-        // Set timeout to 60 seconds for upload
-        const uploadTimeoutId = window.setTimeout(() => {
-          uploadController.abort();
-        }, 60_000);
-        
-        let blob;
-        try {
-          const uploadPromise = upload(pathname, encrypted.encryptedBlob, {
-            access: "private",
-            handleUploadUrl: "/api/upload",
-            clientPayload: JSON.stringify({ roomId: session.roomId, userId: session.userId }),
-            abortSignal: uploadController.signal
-          });
-          
-          // Add a secondary timeout that provides better error messaging
-          const timeoutPromise = new Promise<never>((_, reject) => {
-            const timeoutId = window.setTimeout(() => {
-              uploadController.abort();
-              reject(new Error("Upload timeout. The file upload took too long. Check your internet connection and try again."));
-            }, 65_000);
-            return () => window.clearTimeout(timeoutId);
-          });
-          
-          blob = await Promise.race([uploadPromise, timeoutPromise]);
-        } catch (uploadError) {
-          // Better error messages for different failure scenarios
-          if (uploadError instanceof Error) {
-            if (uploadError.message.includes("abort") || uploadError.message.includes("timeout")) {
-              throw new Error("Upload timed out. The file upload was cancelled due to timeout or slow connection. Please check your internet and try again.");
+
+        // If the blob was already uploaded during file selection, reuse it
+        if (uploadedBlob) {
+          blobUrl = uploadedBlob.url;
+          blobDownloadUrl = uploadedBlob.downloadUrl;
+          blobPathname = uploadedBlob.pathname;
+        } else {
+          // Upload now (fallback for cases where auto-upload didn't happen)
+          setStatus({ text: `Uploading encrypted payload (${formatBytes(encrypted.encryptedBlob.size)})...` });
+          const pathname = `clips/${session.roomId}/${crypto.randomUUID()}-${sanitizeName(selectedFiles[0].name)}.bin`;
+          const uploadController = new AbortController();
+          const uploadTimeoutId = window.setTimeout(() => uploadController.abort(), 60_000);
+
+          let blob;
+          try {
+            const uploadPromise = upload(pathname, encrypted.encryptedBlob, {
+              access: "private",
+              handleUploadUrl: "/api/upload",
+              clientPayload: JSON.stringify({ roomId: session.roomId, userId: session.userId }),
+              abortSignal: uploadController.signal
+            });
+            const timeoutPromise = new Promise<never>((_, reject) => {
+              window.setTimeout(() => {
+                uploadController.abort();
+                reject(new Error("Upload timed out. Check your internet connection and try again."));
+              }, 65_000);
+            });
+            blob = await Promise.race([uploadPromise, timeoutPromise]);
+          } catch (uploadError) {
+            if (uploadError instanceof Error) {
+              if (uploadError.message.includes("abort") || uploadError.message.includes("timeout")) {
+                throw new Error("Upload timed out. Please check your internet and try again.");
+              }
+              if (uploadError.message.includes("not configured") || uploadError.message.includes("BLOB_READ_WRITE_TOKEN")) {
+                throw new Error("Vercel Blob storage is not configured. Add BLOB_READ_WRITE_TOKEN to your .env.local and restart the dev server.");
+              }
+              throw uploadError;
             }
-            if (uploadError.message.includes("not configured") || uploadError.message.includes("BLOB_READ_WRITE_TOKEN")) {
-              throw new Error("Vercel Blob storage is not configured. Add BLOB_READ_WRITE_TOKEN to your .env.local and restart the dev server.");
-            }
-            throw uploadError;
+            throw new Error("File upload failed. Please check your connection and try again.");
+          } finally {
+            window.clearTimeout(uploadTimeoutId);
           }
-          throw new Error("File upload failed. Please check your connection and try again.");
-        } finally {
-          window.clearTimeout(uploadTimeoutId);
+
+          blobUrl = blob.url;
+          blobDownloadUrl = "downloadUrl" in blob ? blob.downloadUrl : undefined;
+          blobPathname = blob.pathname;
         }
-        
-        blobUrl = blob.url;
-        blobDownloadUrl = "downloadUrl" in blob ? blob.downloadUrl : undefined;
-        blobPathname = blob.pathname;
       }
 
       setStatus({ text: "Registering expiring access..." });
@@ -683,11 +883,9 @@ export default function SecureShareApp() {
         })
       });
 
-      // Show success message
-      const successText = hasFiles 
-        ? `✓ Encrypted ${selectedFiles.length} file${selectedFiles.length === 1 ? "" : "s"} uploaded successfully!`
-        : "✓ Encrypted clipboard shared successfully!";
-      setSuccessMessage(successText);
+      // Clear prepared payload after successful send
+      setPreparedPayload(null);
+      setUploadedBlob(null);
       setStatus({ text: "Encrypted content sent.", kind: "success" });
       setStep("sent");
       await refreshInbox();
@@ -769,6 +967,10 @@ export default function SecureShareApp() {
     setExpiryMode("downloads");
     setDownloadLimit("1");
     setExpirySeconds("3600");
+    setPreparedPayload(null);
+    setUploadedBlob(null);
+    setIsUploading(false);
+    setSuccessMessage(null);
     setStep("file");
     setStatus({ text: "" });
     if (inputRef.current) inputRef.current.value = "";
@@ -1380,8 +1582,12 @@ export default function SecureShareApp() {
               <Check size={50} color="#34d399" />
               <h2 id="success-alert-title" style={{ color: "#34d399" }}>Files Uploaded Successfully</h2>
               <p>{successMessage}</p>
-              <button className="button" type="button" onClick={() => setSuccessMessage(null)}>
-                Continue
+              <p className="muted" style={{ fontSize: "0.85rem", marginTop: "0.5rem" }}>Now select a recipient to send your files.</p>
+              <button className="button" type="button" onClick={() => {
+                setSuccessMessage(null);
+                setStep("recipients");
+              }}>
+                Select Recipients
               </button>
             </motion.div>
           </motion.div>
