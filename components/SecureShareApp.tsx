@@ -582,7 +582,7 @@ export default function SecureShareApp() {
       const pathname = `clips/${session.roomId}/${crypto.randomUUID()}-${sanitizeName(files[0].name)}.bin`;
 
       const uploadController = new AbortController();
-      let uploadTimeoutId: NodeJS.Timeout | null = null;
+      let uploadTimeoutId: number | null = null;
       let blobResp: any = null;
       
       try {
