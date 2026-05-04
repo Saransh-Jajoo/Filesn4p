@@ -582,37 +582,60 @@ export default function SecureShareApp() {
       const pathname = `clips/${session.roomId}/${crypto.randomUUID()}-${sanitizeName(files[0].name)}.bin`;
 
       const uploadController = new AbortController();
+      let uploadTimeoutId: NodeJS.Timeout | null = null;
+      let blobResp: any = null;
       
-      // Use a longer timeout (90 seconds) and add elapsed time tracking
-      const uploadPromise = upload(pathname, encryptedBlobLocal, {
-        access: "private",
-        handleUploadUrl: "/api/upload",
-        clientPayload: JSON.stringify({ roomId: session.roomId, userId: session.userId }),
-        abortSignal: uploadController.signal
-      });
-
-      // Set up timeout with abort
-      const uploadTimeoutId = window.setTimeout(() => {
-        uploadController.abort();
-      }, 90_000);
-
-      let blobResp: any;
       try {
-        blobResp = await uploadPromise;
+        console.log(`📤 Starting upload: ${pathname}, size: ${formatBytes(encryptedBlobLocal.size)}`);
+        
+        // Create upload promise
+        const uploadPromise = (async () => {
+          try {
+            const result = await upload(pathname, encryptedBlobLocal, {
+              access: "private",
+              handleUploadUrl: "/api/upload",
+              clientPayload: JSON.stringify({ roomId: session.roomId, userId: session.userId }),
+              abortSignal: uploadController.signal
+            });
+            console.log("✅ Upload completed:", result);
+            return result;
+          } catch (err) {
+            console.error("❌ Upload promise error:", err);
+            throw err;
+          }
+        })();
+
+        // Create timeout promise that explicitly rejects
+        const timeoutPromise = new Promise((_, reject) => {
+          uploadTimeoutId = window.setTimeout(() => {
+            console.warn("⏱️ Upload timeout triggered after 90 seconds");
+            uploadController.abort();
+            reject(new Error("Upload timeout: Request did not complete within 90 seconds"));
+          }, 90_000);
+        });
+
+        // Race between upload and timeout
+        blobResp = await Promise.race([uploadPromise, timeoutPromise]);
+
+        if (!blobResp) {
+          throw new Error("Upload failed: no response from server");
+        }
+
+        if (!blobResp.url) {
+          console.error("Invalid response format:", blobResp);
+          throw new Error("Upload failed: invalid response format (missing url)");
+        }
+
+        const uploadDuration = Date.now() - startTime;
+        console.log(`✓ Upload successful: ${formatBytes(encryptedBlobLocal.size)} in ${uploadDuration}ms`);
+      } catch (uploadErr) {
+        console.error("Upload error caught:", uploadErr);
+        throw uploadErr;
       } finally {
-        window.clearTimeout(uploadTimeoutId);
+        if (uploadTimeoutId) {
+          window.clearTimeout(uploadTimeoutId);
+        }
       }
-
-      if (!blobResp) {
-        throw new Error("Upload failed: no response from server");
-      }
-
-      if (!blobResp.url) {
-        throw new Error("Upload failed: invalid response format from server");
-      }
-
-      const uploadDuration = Date.now() - startTime;
-      console.log(`✓ Uploaded ${formatBytes(encryptedBlobLocal.size)} in ${uploadDuration}ms`);
 
       setUploadedBlob({
         url: blobResp.url,
@@ -636,11 +659,15 @@ export default function SecureShareApp() {
       
       let userMessage = "Upload failed. ";
       if (errorMsg.includes("abort") || errorMsg.includes("timeout")) {
-        userMessage += "Request timed out. Check your internet connection and try again.";
-      } else if (errorMsg.includes("network")) {
-        userMessage += "Network error. Check your connection and try again.";
-      } else if (errorMsg.includes("BLOB_READ_WRITE_TOKEN")) {
-        userMessage += "Vercel Blob is not configured. Contact administrator.";
+        userMessage += "Request timed out (90s). Check internet connection or server logs.";
+      } else if (errorMsg.includes("network") || errorMsg.includes("fetch")) {
+        userMessage += "Network error. Check /api/upload endpoint is reachable.";
+      } else if (errorMsg.includes("BLOB_READ_WRITE_TOKEN") || errorMsg.includes("not configured")) {
+        userMessage += "Vercel Blob not configured. Add BLOB_READ_WRITE_TOKEN in Vercel settings and redeploy.";
+      } else if (errorMsg.includes("401") || errorMsg.includes("403") || errorMsg.includes("Unauthorized")) {
+        userMessage += "Authorization failed. Check Vercel Blob token is valid.";
+      } else if (errorMsg.includes("413") || errorMsg.includes("too large")) {
+        userMessage += "File too large. Maximum size is " + formatBytes(MAX_FILE_SIZE_BYTES) + ".";
       } else {
         userMessage += errorMsg || "Unknown error occurred.";
       }
