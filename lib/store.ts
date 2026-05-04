@@ -26,11 +26,15 @@ declare global {
   var __filesn4pMemoryStore: MemoryStore | undefined;
 }
 
+// Support both Vercel auto-generated naming (KV_REST_API) and manual naming (UPSTASH_REDIS_REST)
+const redisUrl = process.env.UPSTASH_REDIS_REST_KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
+const redisToken = process.env.UPSTASH_REDIS_REST_KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+
 const redis =
-  process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN
+  redisUrl && redisToken
     ? new Redis({
-        url: process.env.UPSTASH_REDIS_REST_URL,
-        token: process.env.UPSTASH_REDIS_REST_TOKEN
+        url: redisUrl,
+        token: redisToken
       })
     : null;
 
@@ -582,5 +586,9 @@ export async function periodicCleanup(): Promise<{ expired: number; staleUsers: 
 }
 
 export function isDurableStoreConfigured() {
-  return !!redis;
+  // Check both naming conventions (Vercel auto-generated and manual)
+  const hasUpstashVars =
+    (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN) ||
+    (process.env.UPSTASH_REDIS_REST_KV_REST_API_URL && process.env.UPSTASH_REDIS_REST_KV_REST_API_TOKEN);
+  return hasUpstashVars && !!redis;
 }
