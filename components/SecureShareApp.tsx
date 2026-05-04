@@ -592,8 +592,9 @@ export default function SecureShareApp() {
         const uploadPromise = (async () => {
           try {
             const result = await upload(pathname, encryptedBlobLocal, {
-              access: "private",
+              access: "public",
               handleUploadUrl: "/api/upload",
+              contentType: "application/octet-stream",
               clientPayload: JSON.stringify({ roomId: session.roomId, userId: session.userId }),
               abortSignal: uploadController.signal
             });
@@ -850,8 +851,9 @@ export default function SecureShareApp() {
           let blob;
           try {
             const uploadPromise = upload(pathname, encrypted.encryptedBlob, {
-              access: "private",
+              access: "public",
               handleUploadUrl: "/api/upload",
+              contentType: "application/octet-stream",
               clientPayload: JSON.stringify({ roomId: session.roomId, userId: session.userId }),
               abortSignal: uploadController.signal
             });
